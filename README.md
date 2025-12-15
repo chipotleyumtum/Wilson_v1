@@ -1,111 +1,313 @@
-## Piper + “Akakios” (LM Studio voice output)
+# 🎙️ WILSON V1 — Offline Voice Assistant
 
-This folder is a small Windows-focused setup that combines:
+```
+ ██╗    ██╗██╗██╗     ███████╗ ██████╗ ███╗   ██╗
+ ██║    ██║██║██║     ██╔════╝██╔═══██╗████╗  ██║
+ ██║ █╗ ██║██║██║     ███████╗██║   ██║██╔██╗ ██║
+ ██║███╗██║██║██║     ╚════██║██║   ██║██║╚██╗██║
+ ╚███╔███╔╝██║███████╗███████║╚██████╔╝██║ ╚████║
+  ╚══╝╚══╝ ╚═╝╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝
+                    V 1 . 0
+        ─────────────────────────────────
+           🔒 100% LOCAL • NO CLOUD
+        ─────────────────────────────────
+```
 
-- **LM Studio** (OpenAI-compatible local API) for chat responses
-- **Piper** (`piper.exe`) for text-to-speech (TTS)
-- A simple Python loop in `akakios.py` that:
-	1) sends your prompt to LM Studio,
-	2) speaks the model’s response using Piper,
-	3) plays the generated `.wav`.
-
-The included voice model in this workspace is `en_US-amy-medium.onnx` (located one directory above this folder).
-
----
-
-## What’s in here
-
-- `akakios.py` — CLI chat loop + TTS playback.
-- `piper.exe` + `*.dll` — Piper binary and runtime libraries.
-- `espeak-ng-data/` + `espeak-ng.dll` — phonemizer data used by Piper.
-- `response.wav` — output file written by `akakios.py` (overwritten each response).
-- `test.wav` — a sample wav file (if present).
-- `libtashkeel_model.ort` — included runtime model file (used by some Piper builds for Arabic; harmless to keep).
-
-One directory above (sibling of this folder):
-
-- `../en_US-amy-medium.onnx` — the voice model.
-- `../en_US-amy-medium.onnx.json` — model config (sample rate, eSpeak voice, inference params).
+A fully offline, local AI voice assistant powered by **Qwen 3 30B**, **Whisper**, and **Piper TTS**. Talk naturally — Wilson listens, thinks, and responds out loud. No internet required.
 
 ---
 
-## Requirements
+## ⚡ Quick Start
 
-- Windows (this bundle uses `piper.exe` and `os.startfile` for playback)
-- Python 3.x
-- LM Studio running locally with the OpenAI-compatible server enabled
+**Make sure LM Studio is running with your model loaded and the server started on port 1234.**
 
-Python dependency:
+```powershell
+cd C:\Users\{REPLACE ME WITH UR USERNAME}\Downloads\piper
+.\wilson_env\Scripts\Activate.ps1
+python wilson_simple.py
+```
 
-- `requests`
+That's it. Start talking!
 
-Install it:
+---
 
-```bash
-pip install requests
+## 🏗️ Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         YOUR VOICE                              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  🎤 MICROPHONE                                                  │
+│     Captures your voice in real-time                            │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  🧠 RealtimeSTT (Whisper)                      [RUNS ON GPU]    │
+│     • Silero VAD detects when you start/stop speaking           │
+│     • Whisper transcribes your speech to text                   │
+│     • Model: base.en (English optimized)                        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  💭 LM STUDIO (Qwen 3 30B)                     [RUNS ON GPU]    │
+│     • Receives your text via localhost:1234                     │
+│     • Generates intelligent response                            │
+│     • Maintains conversation history                            │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  🔊 PIPER TTS                                  [RUNS ON CPU]    │
+│     • Converts response text to speech                          │
+│     • Voice: en_US-amy-medium                                   │
+│     • Plays directly through speakers                           │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        YOUR SPEAKERS                            │
+│                    Wilson speaks to you!                        │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## LM Studio setup
+## 📁 File Structure
 
-`akakios.py` calls this endpoint:
-
-- `http://localhost:1234/v1/chat/completions`
-
-In LM Studio:
-
-1. Download/load a chat model.
-2. Start the local server (OpenAI-compatible).
-3. Ensure it listens on `localhost:1234`.
-
-If your server uses a different host/port, update `LM_STUDIO_URL` in `akakios.py`.
-
----
-
-## Run
-
-From this folder:
-
-```bash
-python akakios.py
+```
+C:\Users\{REPLACE ME WITH UR USERNAME}\Downloads\piper\
+│
+├── wilson_simple.py          ← 🚀 MAIN SCRIPT (run this!)
+├── wilson.py                 ← Alternative version
+├── en_US-amy-medium.onnx     ← Voice model
+├── en_US-amy-medium.onnx.json
+│
+├── piper\                    ← Piper TTS engine
+│   └── piper.exe
+│
+└── wilson_env\               ← Python virtual environment
+    └── Scripts\
+        └── Activate.ps1
 ```
 
-Then type messages at the `You:` prompt. Type `quit` or `exit` to stop.
+---
 
-On each turn:
+## 🛠️ Full Installation Guide
 
-- The assistant response prints to the console.
-- Piper generates audio into `response.wav`.
-- Windows opens the wav using your default associated app.
+### Prerequisites
+
+- **Windows 10/11**
+- **Python 3.10+** (with "Add to PATH" enabled)
+- **NVIDIA GPU** (RTX series recommended)
+- **LM Studio** with a loaded model
 
 ---
 
-## Configuration (important)
+### Step 1: Download Piper TTS
 
-`akakios.py` currently uses **absolute paths** matching one specific machine:
-
-- `PIPER_EXE = C:\Users\username\Downloads\piper\piper\piper.exe`
-- `PIPER_MODEL = C:\Users\username\Downloads\piper\en_US-amy-medium.onnx`
-- `OUTPUT_WAV = C:\Users\username\Downloads\piper\piper\response.wav`
-
-If your folder location is different, edit those constants near the top of `akakios.py`.
-
-To change voices, point `PIPER_MODEL` at a different `*.onnx` model.
+1. Go to: https://github.com/rhasspy/piper/releases
+2. Download `piper_windows_amd64.zip`
+3. Extract to `C:\Users\{REPLACE ME WITH UR USERNAME}\Downloads\piper\`
 
 ---
 
-## Troubleshooting
+### Step 2: Download Voice Model
 
-- **No audio plays**: `os.startfile` depends on a default program for `.wav`. Confirm Windows has a default media player association.
-- **LM Studio errors / connection refused**: make sure the server is running and the URL/port matches `LM_STUDIO_URL`.
-- **Piper fails silently**: stderr is suppressed (`stderr=subprocess.DEVNULL`). Temporarily remove that line to see Piper error output.
-- **Output file in use**: close the media player that has `response.wav` open, or change `OUTPUT_WAV`.
+1. Go to: https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/amy/medium
+2. Download:
+   - `en_US-amy-medium.onnx`
+   - `en_US-amy-medium.onnx.json`
+3. Place both in `C:\Users\{REPLACE ME WITH UR USERNAME}\Downloads\piper\`
 
 ---
 
-## Notes
+### Step 3: Create Virtual Environment
 
-- The text is lightly “cleaned” before TTS (removes `*`, `#`, and backticks) to reduce awkward spoken punctuation.
-- `response.wav` is overwritten each response.
+```powershell
+cd C:\Users\{REPLACE ME WITH UR USERNAME}\Downloads\piper
+python -m venv wilson_env
+.\wilson_env\Scripts\Activate.ps1
+```
 
+> **If you get a script execution error:**
+> ```powershell
+> Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+> ```
+
+---
+
+### Step 4: Install Dependencies
+
+```powershell
+pip install realtimestt requests pyaudio
+pip install torch torchaudio
+```
+
+---
+
+### Step 5: Install FFmpeg
+
+```powershell
+winget install ffmpeg
+```
+
+Verify:
+```powershell
+ffmpeg -version
+```
+
+---
+
+### Step 6: Set Up LM Studio
+
+1. Open **LM Studio**
+2. Download and load **Qwen 3 30B** (or your preferred model)
+3. Go to **Developer** tab
+4. Set **System Prompt**:
+   ```
+   You are Wilson_V1, an advanced AI assistant. Your name is Wilson. 
+   When asked your name, say Wilson or Wilson_V1. 
+   When asked about your model, say you're built on Qwen 3.
+   Keep responses concise. No emojis or markdown.
+   ```
+5. Click **Start Server** (should show `localhost:1234`)
+
+---
+
+### Step 7: Run Wilson
+
+```powershell
+cd C:\Users\{REPLACE ME WITH UR USERNAME}\Downloads\piper
+.\wilson_env\Scripts\Activate.ps1
+python wilson_simple.py
+```
+
+---
+
+## 🎮 Usage
+
+```
+==================================================
+       WILSON V1 - Voice Assistant
+==================================================
+Speak naturally. Press Ctrl+C to exit.
+==================================================
+
+🎤 Listening...
+```
+
+1. **Speak naturally** — Wilson detects when you start and stop talking
+2. **Wait ~0.5 seconds** — after you stop, Wilson processes your speech
+3. **Listen** — Wilson responds out loud through your speakers
+4. **Repeat** — conversation continues automatically
+5. **Exit** — Press `Ctrl+C` to quit
+
+---
+
+## ⚙️ Configuration
+
+Edit the top of `wilson_simple.py` to customize:
+
+```python
+# ============== CONFIGURATION ==============
+
+# LM Studio API endpoint
+LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
+
+# Piper TTS paths
+PIPER_EXE = r"C:\Users\{REPLACE ME WITH UR USERNAME}\Downloads\piper\piper\piper.exe"
+PIPER_VOICE = r"C:\Users\{REPLACE ME WITH UR USERNAME}\Downloads\piper\en_US-amy-medium.onnx"
+
+# Wilson's personality
+SYSTEM_PROMPT = """You are Wilson_V1, an advanced AI assistant.
+Your name is Wilson. When asked your name, say Wilson or Wilson_V1.
+When asked about your model or architecture, say you're built on Qwen 3.
+Keep responses concise - 1-3 sentences. No emojis or markdown."""
+```
+
+### Voice Sensitivity
+
+In the `run()` method, adjust these for your microphone:
+
+```python
+recorder = AudioToTextRecorder(
+    silero_sensitivity=0.4,           # Lower = more sensitive (0.1-0.9)
+    post_speech_silence_duration=0.5, # Seconds to wait after you stop talking
+)
+```
+
+---
+
+## 🔧 Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| `python is not recognized` | Reinstall Python, check "Add to PATH" |
+| `Script execution disabled` | Run: `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` |
+| `No module named X` | Activate venv: `.\wilson_env\Scripts\Activate.ps1` then `pip install X` |
+| `Connection refused` | Start LM Studio server on port 1234 |
+| `No sound output` | Check Windows sound settings, verify speakers are default |
+| `Microphone not detected` | Check Windows privacy settings for microphone access |
+| `CUDA warnings` | These are normal for RTX 50-series, Wilson still works |
+
+---
+
+## 🔒 Privacy & Offline Guarantee
+
+| Component | Location | Internet Required? |
+|-----------|----------|-------------------|
+| Speech Recognition (Whisper) | Your GPU | ❌ No |
+| Language Model (Qwen 3) | LM Studio (localhost) | ❌ No |
+| Text-to-Speech (Piper) | Your CPU | ❌ No |
+| Voice Models | Local files | ❌ No |
+
+**✅ Turn off WiFi — Wilson still works.**
+
+All processing happens on your machine. No data is ever sent to external servers.
+
+---
+
+## 🎯 Future Enhancements
+
+- [ ] Wake word detection ("Hey Wilson")
+- [ ] Interrupt handling (stop Wilson mid-sentence)
+- [ ] Multiple voice options
+- [ ] GUI interface
+- [ ] Conversation saving/loading
+
+---
+
+## 📜 Credits
+
+- **Piper TTS** — https://github.com/rhasspy/piper
+- **RealtimeSTT** — https://github.com/KoljaB/RealtimeSTT
+- **Whisper** — OpenAI (via faster-whisper)
+- **LM Studio** — https://lmstudio.ai
+- **Qwen 3 30B Parameter** — Alibaba Cloud
+
+---
+
+## 📄 License
+
+This project is for personal use. Individual components have their own licenses:
+- Piper: MIT License
+- RealtimeSTT: MIT License
+- Whisper: MIT License
+
+---
+
+```
+        ╔═══════════════════════════════════════╗
+        ║                                       ║
+        ║   Built for the Akakios Project       ║
+        ║   100% Offline • 100% Private         ║
+        ║                                       ║
+        ║   "Your AI, Your Hardware, Your Data" ║
+        ║                                       ║
+        ╚═══════════════════════════════════════╝
+```
