@@ -85,9 +85,9 @@ On each turn:
 
 `akakios.py` currently uses **absolute paths** matching one specific machine:
 
-- `PIPER_EXE = C:\Users\icanm\Downloads\piper\piper\piper.exe`
-- `PIPER_MODEL = C:\Users\icanm\Downloads\piper\en_US-amy-medium.onnx`
-- `OUTPUT_WAV = C:\Users\icanm\Downloads\piper\piper\response.wav`
+- `PIPER_EXE = C:\Users\username\Downloads\piper\piper\piper.exe`
+- `PIPER_MODEL = C:\Users\username\Downloads\piper\en_US-amy-medium.onnx`
+- `OUTPUT_WAV = C:\Users\username\Downloads\piper\piper\response.wav`
 
 If your folder location is different, edit those constants near the top of `akakios.py`.
 
