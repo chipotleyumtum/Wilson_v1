@@ -101,20 +101,20 @@ class Transcriber:
         
     def load(self, callback=None):
         try:
-            from faster_whisper import WhisperModel
+            import faster_whisper
             if callback:
                 callback(f"Loading Whisper '{WHISPER_MODEL}' model...")
             
             # Try GPU first, fall back to CPU
             try:
-                self.model = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
+                self.model = faster_whisper.WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
                 if callback:
                     callback("Whisper loaded on GPU")
             except Exception as e:
                 if callback:
                     callback(f"GPU failed: {e}")
                     callback("Falling back to CPU...")
-                self.model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+                self.model = faster_whisper.WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
                 if callback:
                     callback("Whisper loaded on CPU")
             return True
