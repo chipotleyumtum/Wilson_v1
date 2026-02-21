@@ -1,5 +1,6 @@
 """
-WILSON V2 - Offline Voice Assistant (GPU Enabled)
+WILSON V1 — Legacy Backup (original Windows-only version)
+This file is kept as a reference. The main version is wilson.py.
 """
 
 import tkinter as tk

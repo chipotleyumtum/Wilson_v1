@@ -1,11 +1,9 @@
 """
-WILSON V2 — Offline Voice Assistant (Edge-Optimized)
+WILSON V1 — Offline Voice Assistant
 
-Primary target : NVIDIA Jetson Orin Nano Super Developer Kit (ARM64)
-Also supports  : Windows x86_64 (original dev platform)
-
-Pipeline:
-  Mic → faster-whisper (CTranslate2 / CUDA) → LLM (Ollama | LM Studio) → Piper TTS → Speaker
+Supports : Windows, macOS (Intel & Apple Silicon), Linux, NVIDIA Jetson
+GPU      : NVIDIA CUDA auto-detected — falls back to CPU if unavailable
+Pipeline : Mic → faster-whisper (STT) → LLM (Ollama | LM Studio) → Piper TTS → Speaker
 
 Environment-variable overrides (all optional):
   WILSON_LLM_URL           LLM API endpoint
@@ -23,8 +21,6 @@ Environment-variable overrides (all optional):
 # ═══════════════════════════════════════════════════════════════════════════════
 #                                IMPORTS
 # ═══════════════════════════════════════════════════════════════════════════════
-
-print("DEBUG: wilson.py started", flush=True)
 
 import threading
 import subprocess
@@ -65,6 +61,7 @@ except ImportError:
 
 IS_LINUX   = sys.platform.startswith("linux")
 IS_WINDOWS = sys.platform == "win32"
+IS_MACOS   = sys.platform == "darwin"
 IS_ARM64   = platform.machine() in ("aarch64", "arm64")
 IS_JETSON  = IS_LINUX and IS_ARM64
 
@@ -89,31 +86,46 @@ if IS_JETSON:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _cuda_is_usable():
-    """Return True only if CUDA is genuinely usable for CTranslate2 / Whisper.
-    CTranslate2 can report CUDA 'supported' at compile time even when the CUDA
-    runtime DLLs (cublas64_12.dll, etc.) are not installed.  We verify here.
-    IMPORTANT: Must not block or hang — no ctypes.cdll.LoadLibrary probes."""
+    """Return True if CUDA is usable for CTranslate2 / Whisper."""
+    # macOS has no CUDA support (Apple Silicon uses Metal, not supported by CT2)
+    if IS_MACOS:
+        return False
 
     # Quick gate: if torch is available, trust its CUDA probe (most reliable)
     try:
         import torch
-        return torch.cuda.is_available()
+        if torch.cuda.is_available():
+            print(f"[CUDA] {torch.cuda.get_device_name(0)}")
+            return True
     except ImportError:
         pass
 
-    # No torch — look for CUDA files on disk (fast, non-blocking checks only)
+    # Check if ctranslate2 itself reports CUDA support (pip wheels bundle CUDA)
+    try:
+        import ctranslate2
+        cuda_types = ctranslate2.get_supported_compute_types("cuda")
+        if cuda_types:
+            return True
+    except Exception:
+        pass
+
+    # No torch / CT2 — look for CUDA files on disk (fast, non-blocking checks)
     if IS_WINDOWS:
-        # 1) Check CUDA_PATH env variable
+        # 1) Check for pip-installed nvidia-cublas package (any CUDA version)
+        try:
+            import nvidia.cublas
+            return True
+        except ImportError:
+            pass
+        # 2) Check CUDA_PATH env variable (system-installed CUDA toolkit)
         cuda_path = os.environ.get("CUDA_PATH", "")
         if cuda_path and os.path.isdir(os.path.join(cuda_path, "bin")):
-            for dll in ("cublas64_12.dll", "cublas64_11.dll"):
-                if os.path.isfile(os.path.join(cuda_path, "bin", dll)):
-                    return True
-        # 2) Check nvidia-smi exists (basic driver check)
-        if shutil.which("nvidia-smi") is None:
-            # No NVIDIA driver at all — definitely no CUDA
-            return False
-        # nvidia-smi exists but no CUDA_PATH — partial driver install, unsafe
+            return True
+        # 3) Check nvidia-smi exists (NVIDIA driver is installed)
+        #    If the driver is present, CUDA *should* work — let the Whisper
+        #    fallback chain handle it if it doesn't.
+        if shutil.which("nvidia-smi") is not None:
+            return True
         return False
 
     if IS_LINUX:
@@ -139,20 +151,30 @@ PIPER_EXE   = os.path.join(WILSON_DIR, "piper", "piper.exe" if IS_WINDOWS else "
 PIPER_VOICE = os.path.join(WILSON_DIR, "en_US-amy-medium.onnx")
 
 # ── LLM Backend ──────────────────────────────────────────────────────────────
-#  Jetson  → Ollama (default http://localhost:11434)
-#  Windows → LM Studio (default http://localhost:1234)
+#  Jetson       → Ollama (default http://localhost:11434)
+#  macOS / Linux → Ollama (most common local LLM on Mac/Linux)
+#  Windows      → LM Studio (default http://localhost:1234)
 if IS_JETSON:
     LLM_URL   = os.environ.get("WILSON_LLM_URL",   "http://localhost:11434/v1/chat/completions")
     LLM_MODEL = os.environ.get("WILSON_LLM_MODEL",  "qwen2.5:7b-instruct-q4_K_M")
-else:
+elif IS_MACOS or IS_LINUX:
+    LLM_URL   = os.environ.get("WILSON_LLM_URL",   "http://localhost:11434/v1/chat/completions")
+    LLM_MODEL = os.environ.get("WILSON_LLM_MODEL",  "")          # Ollama auto-selects
+else:   # Windows
     LLM_URL   = os.environ.get("WILSON_LLM_URL",   "http://localhost:1234/v1/chat/completions")
     LLM_MODEL = os.environ.get("WILSON_LLM_MODEL",  "")          # LM Studio auto-selects
 
 # ── Whisper STT ───────────────────────────────────────────────────────────────
 #  Jetson  → base model, float16, CUDA  (~300 MB of shared 8 GB)
-#  Windows → small model, float16, CUDA if available, else CPU
+#  GPU PC  → small model, float16, CUDA
+#  CPU/Mac → small model, int8 (or float32 on macOS ARM for compatibility)
 _default_device  = "cuda" if CUDA_AVAILABLE else "cpu"
-_default_compute = "float16" if CUDA_AVAILABLE else "int8"
+if CUDA_AVAILABLE:
+    _default_compute = "float16"
+elif IS_MACOS and IS_ARM64:
+    _default_compute = "float32"      # int8 can be unreliable on Apple Silicon
+else:
+    _default_compute = "int8"
 
 WHISPER_MODEL   = os.environ.get("WILSON_WHISPER_MODEL",   "base"    if IS_JETSON else "small")
 WHISPER_COMPUTE = os.environ.get("WILSON_WHISPER_COMPUTE",  _default_compute)
@@ -176,8 +198,12 @@ HEADLESS = (
 )
 
 # ── Fonts (cross-platform) ───────────────────────────────────────────────────
-FONT_UI   = "Ubuntu"      if IS_LINUX else "Segoe UI"
-FONT_MONO = "Ubuntu Mono" if IS_LINUX else "Consolas"
+if IS_LINUX:
+    FONT_UI, FONT_MONO = "Ubuntu", "Ubuntu Mono"
+elif IS_MACOS:
+    FONT_UI, FONT_MONO = "Helvetica Neue", "Menlo"
+else:   # Windows
+    FONT_UI, FONT_MONO = "Segoe UI", "Consolas"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -531,10 +557,12 @@ class TTSEngine:
             shutil.which("espeak-ng") is not None
             or shutil.which("espeak") is not None
         )
+        # macOS ships with the 'say' command — use it as a last-resort fallback
+        self.has_say = IS_MACOS and shutil.which("say") is not None
 
         if self.has_piper:
-            # Ensure +x on Linux
-            if IS_LINUX:
+            # Ensure +x on Linux / macOS
+            if not IS_WINDOWS:
                 try:
                     os.chmod(PIPER_EXE, 0o755)
                 except OSError:
@@ -542,6 +570,8 @@ class TTSEngine:
             print(f"[TTS] Piper @ {PIPER_EXE}")
         elif self.has_espeak:
             print("[TTS] Piper not found — using espeak-ng fallback")
+        elif self.has_say:
+            print("[TTS] Piper not found — using macOS 'say' fallback")
         else:
             print("[TTS] WARNING: No TTS engine available")
 
@@ -553,6 +583,8 @@ class TTSEngine:
             self._piper(text, log_fn)
         elif self.has_espeak:
             self._espeak(text, log_fn)
+        elif self.has_say:
+            self._say(text, log_fn)
         else:
             if log_fn:
                 log_fn("No TTS engine available")
@@ -586,10 +618,12 @@ class TTSEngine:
                 pass
         except FileNotFoundError:
             if log_fn:
-                log_fn("Piper binary not found — switching to espeak-ng")
+                log_fn("Piper binary not found — switching to fallback TTS")
             self.has_piper = False
             if self.has_espeak:
                 self._espeak(text, log_fn)
+            elif self.has_say:
+                self._say(text, log_fn)
         except Exception as e:
             if log_fn:
                 log_fn(f"TTS error: {e}")
@@ -612,6 +646,19 @@ class TTSEngine:
         except Exception as e:
             if log_fn:
                 log_fn(f"espeak error: {e}")
+
+    # ── macOS 'say' fallback ──────────────────────────────────────────────────
+
+    def _say(self, text, log_fn=None):
+        try:
+            subprocess.run(
+                ["say", "-v", "Samantha", text],
+                capture_output=True,
+                timeout=30,
+            )
+        except Exception as e:
+            if log_fn:
+                log_fn(f"macOS say error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -658,8 +705,8 @@ class LLMClient:
             # Return only the visible answer (strip reasoning blocks)
             return self._strip_thinking(raw_reply)
         except requests.exceptions.ConnectionError:
-            backend = "Ollama" if IS_JETSON else "LM Studio"
-            port    = "11434"  if IS_JETSON else "1234"
+            backend = "LM Studio" if IS_WINDOWS else "Ollama"
+            port    = "1234"      if IS_WINDOWS else "11434"
             return f"Cannot connect to {backend}. Start the server on port {port}."
         except requests.exceptions.Timeout:
             return (
@@ -682,10 +729,8 @@ class WilsonGUI:
     Windows desktop.  Jetson-specific widgets show live system telemetry."""
 
     def __init__(self):
-        print("DEBUG: WilsonGUI.__init__ started", flush=True)
         self.root = tk.Tk()
-        print("DEBUG: tk.Tk() created", flush=True)
-        self.root.title("WILSON V2")
+        self.root.title("WILSON V1")
         self.root.geometry("520x820" if IS_JETSON else "500x750")
         self.root.configure(bg="#0d1117")
         self.root.resizable(True, True)
@@ -696,24 +741,18 @@ class WilsonGUI:
         self.recorder      = None
         self.transcriber   = None
         self.tts           = None
-        print("DEBUG: Initializing LLMClient", flush=True)
         self.llm           = LLMClient()
-        print("DEBUG: Initializing JetsonMonitor", flush=True)
         self.monitor       = JetsonMonitor()
         self.msg_queue     = queue.Queue()
 
-        print("DEBUG: Building UI", flush=True)
         self._build_ui()
-        print("DEBUG: Checking queue", flush=True)
         self._check_queue()
-        print("DEBUG: Starting background thread", flush=True)
         threading.Thread(target=self._initialize, daemon=True).start()
-        print("DEBUG: WilsonGUI.__init__ finished", flush=True)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
-        title    = "WILSON V2"
+        title    = "WILSON V1"
         subtitle = JETSON_MODEL if IS_JETSON else "Offline Voice Assistant"
 
         # Header
@@ -799,9 +838,10 @@ class WilsonGUI:
         self.root.bind("<space>", lambda e: self._toggle_listening())
 
         # Footer
+        _llm_name = "LM Studio" if IS_WINDOWS else "Ollama"
         cfg = (
             f"STT: Whisper {WHISPER_MODEL} ({WHISPER_DEVICE})  \u00b7  "
-            f"LLM: {'Ollama' if IS_JETSON else 'LM Studio'}"
+            f"LLM: {_llm_name}"
         )
         tk.Label(
             self.root, text=cfg,
@@ -852,7 +892,7 @@ class WilsonGUI:
             if s:
                 self.stats_label.config(text=s)
 
-        self.root.after(50, self._check_queue)
+        self.root.after(60, self._check_queue)
 
     # ── initialization ────────────────────────────────────────────────────────
 
@@ -984,9 +1024,7 @@ class WilsonGUI:
         self.root.destroy()
 
     def run(self):
-        print("DEBUG: Starting mainloop", flush=True)
         self.root.mainloop()
-        print("DEBUG: Mainloop finished", flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1111,8 +1149,14 @@ def run_diagnostics():
         if not result:
             ok = False
 
+    def info(label, result, detail=""):
+        """Like check(), but doesn't affect the overall pass/fail status."""
+        sym = "\033[92m\u2713\033[0m" if result else "\033[93m\u2014\033[0m"
+        d = f"  ({detail})" if detail else ""
+        print(f"  {sym} {label}{d}")
+
     print(f"\n{'='*58}")
-    print("  WILSON V2 — System Diagnostics")
+    print("  WILSON V1 — System Diagnostics")
     print(f"{'='*58}\n")
 
     # Platform
@@ -1164,8 +1208,12 @@ def run_diagnostics():
     check("Piper binary", os.path.isfile(PIPER_EXE), PIPER_EXE)
     check("Voice model",  os.path.isfile(PIPER_VOICE), PIPER_VOICE)
     espeak = shutil.which("espeak-ng") or shutil.which("espeak")
-    check("espeak-ng fallback", espeak is not None,
-          espeak if espeak else "not found")
+    info("espeak-ng fallback", espeak is not None,
+          espeak if espeak else "optional — not needed if Piper is installed")
+    if IS_MACOS:
+        mac_say = shutil.which("say")
+        info("macOS say fallback", mac_say is not None,
+              mac_say if mac_say else "optional — not needed if Piper is installed")
 
     # LLM
     print("\n  LLM endpoint:")
@@ -1214,7 +1262,7 @@ def print_banner():
     lines.append(f"  TTS       : Piper ({'found' if os.path.isfile(PIPER_EXE) else 'NOT FOUND'})")
 
     print(f"\n{'='*58}")
-    print("  WILSON V2 \u2014 Offline Voice Assistant (Edge-Optimized)")
+    print("  WILSON V1 \u2014 Offline Voice Assistant")
     print(f"{'='*58}")
     for l in lines:
         print(l)
@@ -1222,8 +1270,7 @@ def print_banner():
 
 
 if __name__ == "__main__":
-    # Immediate feedback so the user knows something is happening
-    print("Wilson V2 starting...", flush=True)
+    print("Wilson starting...", flush=True)
 
     # --check: run diagnostics and exit
     if "--check" in sys.argv:
