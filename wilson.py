@@ -33,7 +33,9 @@ import time
 import queue
 import gc
 import re
+import random
 import shutil
+import math
 import numpy as np
 
 # sounddevice is lazy-loaded because PortAudio can hang during device
@@ -589,6 +591,37 @@ class TTSEngine:
             if log_fn:
                 log_fn("No TTS engine available")
 
+    def generate_wav(self, text, log_fn=None):
+        """Generate TTS audio and return (numpy_array, sample_rate) without playing.
+        Returns (None, None) if generation fails or Piper is unavailable."""
+        text = re.sub(r"[*#`]", "", text).replace("\n", " ").strip()
+        if not text or not self.has_piper:
+            return None, None
+        tmp = os.path.join(tempfile.gettempdir(), "wilson_tts_gen.wav")
+        try:
+            proc = subprocess.Popen(
+                [PIPER_EXE, "--model", PIPER_VOICE, "--output_file", tmp],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            proc.communicate(input=text.encode("utf-8"), timeout=30)
+            proc.wait()
+            time.sleep(0.05)
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                import soundfile as sf
+                data, sr = sf.read(tmp)
+                return data, sr
+        except Exception as e:
+            if log_fn:
+                log_fn(f"TTS generate error: {e}")
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return None, None
+
     # ── Piper ─────────────────────────────────────────────────────────────────
 
     def _piper(self, text, log_fn=None):
@@ -725,16 +758,62 @@ class LLMClient:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class WilsonGUI:
-    """Tkinter-based graphical interface.  Works on both HDMI-out Jetson and
-    Windows desktop.  Jetson-specific widgets show live system telemetry."""
+    """Tkinter-based graphical interface. Works on both HDMI-out Jetson and
+    Windows desktop. Jetson-specific widgets show live system telemetry.
+    Hardened for resilience, localized, and optimized for performance."""
+
+    THEME = {
+        "bg_main": "#1e1e2e",         # Modern dark (Catppuccin Macchiato based)
+        "bg_panel": "#181825",
+        "fg_title": "#89b4fa",        # Blue accent
+        "fg_text": "#cad3f5",         # Main text
+        "fg_sub": "#a5adcb",          # Subtext
+        "accent_ready": "#a6da95",    # Green
+        "accent_ready_hover": "#8bd5ca",
+        "accent_listen": "#ed8796",   # Red
+        "accent_process": "#f5a97f",  # Orange
+        "color_user": "#8aa2f8",
+        "color_wilson": "#a6da95",
+        "color_system": "#5b6078",
+    }
+
+    I18N = {
+        "title": "WILSON V1",
+        "subtitle": "Offline Voice Assistant",
+        "btn_ready": "🎤 CLICK TO START LISTENING",
+        "btn_listen": "🔴 LISTENING… (click to stop)",
+        "btn_process": "⌛ PROCESSING…",
+        "status_init": "Initializing…",
+        "status_ready": "Ready",
+        "status_dictate": "Listening…",
+        "status_process": "Processing…",
+        "status_transcribe": "Transcribing…",
+        "status_think": "Thinking…",
+        "status_speak": "Speaking…",
+        "status_error": "Error",
+        "telemetry_load": "Telemetry loading…",
+        "volume": "Volume:",
+        "footer_hints": "Spacebar or click • Auto-stops on silence"
+    }
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("WILSON V1")
-        self.root.geometry("520x820" if IS_JETSON else "500x750")
-        self.root.configure(bg="#0d1117")
-        self.root.resizable(True, True)
-        self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
+        self.root.title(self.I18N["title"])
+        
+        # Transparent Circular Window setup
+        self._transparent_key = "#000001"
+        self.root.geometry("700x700")
+        self.root.configure(bg=self._transparent_key)
+        
+        if IS_WINDOWS:
+            self.root.attributes("-transparentcolor", self._transparent_key)
+            self.root.overrideredirect(True) # Remove titlebar
+            # Bind ESC to quit because native close button is gone
+            self.root.bind("<Escape>", lambda e: self.shutdown())
+
+        # Dragging variables
+        self._drag_x = 0
+        self._drag_y = 0
 
         self.is_listening  = False
         self.is_processing = False
@@ -745,154 +824,387 @@ class WilsonGUI:
         self.monitor       = JetsonMonitor()
         self.msg_queue     = queue.Queue()
 
+        # Matrix text animation state
+        self._matrix_busy = False
+
+        # Mouth / face animation state
+        self._mouth_active = False
+        self._mouth_data = []
+        self._mouth_openness = 0.0
+        self._mouth_start = 0.0
+        self._mouth_duration = 0.0
+        self._eye_open = True
+
+        # Cache formatting elements for optimization
+        self._font_title = (FONT_UI, 24, "bold")
+        self._font_sub = (FONT_UI, 10)
+        self._font_mono = (FONT_MONO, 10)
+        self._font_btn = (FONT_UI, 13, "bold")
+
         self._build_ui()
         self._check_queue()
         threading.Thread(target=self._initialize, daemon=True).start()
 
+    # ── window dragging ───────────────────────────────────────────────────────
+    
+    def _start_drag(self, event):
+        self._drag_x = event.x
+        self._drag_y = event.y
+
+    def _on_drag(self, event):
+        x = self.root.winfo_pointerx() - self._drag_x
+        y = self.root.winfo_pointery() - self._drag_y
+        self.root.geometry(f"+{x}+{y}")
+
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
-        title    = "WILSON V1"
-        subtitle = JETSON_MODEL if IS_JETSON else "Offline Voice Assistant"
+        t = self.THEME
+        i18n = self.I18N
 
-        # Header
-        tk.Label(
-            self.root, text=f"\u25c8 {title} \u25c8",
-            font=(FONT_UI, 22, "bold"),
-            fg="#58a6ff", bg="#0d1117",
-        ).pack(pady=(15, 0))
+        # Draw transparent background with circular shape
+        self.bg_canvas = tk.Canvas(self.root, bg=self._transparent_key, highlightthickness=0)
+        self.bg_canvas.pack(fill=tk.BOTH, expand=True)
+        
+        # Create outer circle with breathing room
+        self.bg_canvas.create_oval(25, 25, 675, 675, fill=t["bg_main"], outline=t["fg_title"], width=3)
+        
+        # Bind left-click and drag events to canvas for window movement
+        self.bg_canvas.bind("<ButtonPress-1>", self._start_drag)
+        self.bg_canvas.bind("<B1-Motion>", self._on_drag)
+
+        # Central container restricted closely inside the circle to avoid cutoff
+        self.main_container = tk.Frame(self.root, bg=t["bg_main"])
+        self.main_container.place(relx=0.5, rely=0.5, anchor="center", width=480, height=570)
+
+        subtitle = JETSON_MODEL if IS_JETSON else i18n["subtitle"]
+
+        # Header with drag & close actions explicitly mapped
+        top_frame = tk.Frame(self.main_container, bg=t["bg_main"])
+        top_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        close_btn = tk.Label(top_frame, text="✕", font=(FONT_UI, 14, "bold"), fg=t["accent_listen"], bg=t["bg_main"], cursor="hand2")
+        close_btn.pack(side=tk.RIGHT, padx=5)
+        close_btn.bind("<Button-1>", lambda e: self.shutdown())
 
         tk.Label(
-            self.root, text=subtitle,
-            font=(FONT_UI, 9),
-            fg="#484f58", bg="#0d1117",
+            self.main_container, text=f"◈ {i18n['title']} ◈",
+            font=self._font_title,
+            fg=t["fg_title"], bg=t["bg_main"],
+        ).pack(pady=(0, 5))
+
+        tk.Label(
+            self.main_container, text=subtitle,
+            font=self._font_sub,
+            fg=t["fg_sub"], bg=t["bg_main"],
         ).pack()
+
+        # ── Animated Face (eyes + mouth) ──────────────────────────────────
+        self.face_canvas = tk.Canvas(
+            self.main_container, width=200, height=100,
+            bg=t["bg_main"], highlightthickness=0,
+        )
+        self.face_canvas.pack(pady=(8, 2))
+        self._draw_face()
+        self._schedule_blink()
 
         # Jetson telemetry bar
         if IS_JETSON:
             self.stats_label = tk.Label(
-                self.root, text="Telemetry loading\u2026",
-                font=(FONT_MONO, 8),
-                fg="#8b949e", bg="#161b22",
-                anchor="w", padx=8, pady=4,
+                self.main_container, text=i18n["telemetry_load"],
+                font=(FONT_MONO, 9),
+                fg=t["fg_sub"], bg=t["bg_panel"],
+                anchor="w", padx=10, pady=5,
             )
-            self.stats_label.pack(fill=tk.X, padx=20, pady=(8, 0))
+            self.stats_label.pack(fill=tk.X, padx=20, pady=(10, 0))
 
         # Status indicator
-        sf = tk.Frame(self.root, bg="#0d1117")
-        sf.pack(pady=8)
+        sf = tk.Frame(self.main_container, bg=t["bg_main"])
+        sf.pack(pady=10)
 
         self.status_dot = tk.Label(
-            sf, text="\u25cf", font=(FONT_UI, 16),
-            fg="#f0883e", bg="#0d1117",
+            sf, text="●", font=(FONT_UI, 18),
+            fg=t["accent_process"], bg=t["bg_main"],
         )
         self.status_dot.pack(side=tk.LEFT)
 
         self.status_text = tk.Label(
-            sf, text="Initializing\u2026",
-            font=(FONT_UI, 12), fg="#c9d1d9", bg="#0d1117",
+            sf, text=i18n["status_init"],
+            font=(FONT_UI, 12), fg=t["fg_text"], bg=t["bg_main"],
         )
         self.status_text.pack(side=tk.LEFT, padx=(8, 0))
 
         # Volume meter
-        vf = tk.Frame(self.root, bg="#0d1117")
-        vf.pack(pady=(0, 6))
+        vf = tk.Frame(self.main_container, bg=t["bg_main"])
+        vf.pack(pady=(0, 10))
 
         tk.Label(
-            vf, text="Volume:", font=(FONT_UI, 9),
-            fg="#484f58", bg="#0d1117",
+            vf, text=i18n["volume"], font=(FONT_UI, 10),
+            fg=t["fg_sub"], bg=t["bg_main"],
         ).pack(side=tk.LEFT)
 
         self.volume_bar = ttk.Progressbar(
             vf, length=180, mode="determinate", maximum=100,
         )
-        self.volume_bar.pack(side=tk.LEFT, padx=5)
+        self.volume_bar.pack(side=tk.LEFT, padx=8)
 
-        # Chat log
-        cf = tk.Frame(self.root, bg="#161b22", padx=2, pady=2)
-        cf.pack(padx=20, pady=5, fill=tk.BOTH, expand=True)
+        # Chat log (Robust text overflow handling via wrap)
+        cf = tk.Frame(self.main_container, bg=t["bg_panel"], padx=3, pady=3)
+        cf.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
 
         self.chat = scrolledtext.ScrolledText(
-            cf, font=(FONT_MONO, 10),
-            bg="#0d1117", fg="#c9d1d9",
+            cf, font=self._font_mono,
+            bg=t["bg_main"], fg=t["fg_text"],
             wrap=tk.WORD, state=tk.DISABLED,
-            relief=tk.FLAT, padx=10, pady=10,
+            relief=tk.FLAT, padx=12, pady=12,
         )
         self.chat.pack(fill=tk.BOTH, expand=True)
-        self.chat.tag_configure("user",   foreground="#58a6ff")
-        self.chat.tag_configure("wilson", foreground="#7ee787")
-        self.chat.tag_configure("system", foreground="#484f58")
+        self.chat.tag_configure("user",   foreground=t["color_user"])
+        self.chat.tag_configure("wilson", foreground=t["color_wilson"], spacing1=4, spacing3=4)
+        self.chat.tag_configure("system", foreground=t["color_system"], justify=tk.CENTER)
 
-        # Listen button
+        # Listen button (Delightr: larger, more padding, distinct colors)
         self.btn = tk.Button(
-            self.root,
-            text="\U0001f3a4  CLICK TO START LISTENING",
-            font=(FONT_UI, 13, "bold"),
-            bg="#238636", fg="#ffffff",
-            activebackground="#2ea043",
+            self.main_container,
+            text=i18n["btn_ready"],
+            font=self._font_btn,
+            bg=t["bg_panel"], fg=t["accent_ready"],
+            activebackground=t["bg_panel"], activeforeground=t["accent_ready_hover"],
+            highlightthickness=1, highlightbackground=t["accent_ready"],
             relief=tk.FLAT, width=28, height=2,
             cursor="hand2",
             command=self._toggle_listening,
         )
-        self.btn.pack(pady=12)
+        self.btn.pack(pady=10)
         self.root.bind("<space>", lambda e: self._toggle_listening())
 
         # Footer
         _llm_name = "LM Studio" if IS_WINDOWS else "Ollama"
         cfg = (
-            f"STT: Whisper {WHISPER_MODEL} ({WHISPER_DEVICE})  \u00b7  "
+            f"STT: Whisper {WHISPER_MODEL} ({WHISPER_DEVICE})  ·  "
             f"LLM: {_llm_name}"
         )
         tk.Label(
-            self.root, text=cfg,
-            font=(FONT_UI, 8), fg="#30363d", bg="#0d1117",
+            self.main_container, text=cfg,
+            font=(FONT_UI, 8), fg=t["color_system"], bg=t["bg_main"],
         ).pack()
 
         tk.Label(
-            self.root,
-            text="Spacebar or click  \u00b7  Auto-stops on silence",
-            font=(FONT_UI, 9), fg="#30363d", bg="#0d1117",
-        ).pack(pady=(0, 12))
+            self.main_container,
+            text=i18n["footer_hints"] + " • ESC to quit",
+            font=(FONT_UI, 9), fg=t["color_system"], bg=t["bg_main"],
+        ).pack(pady=(2, 10))
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
-    def _set_status(self, text, color="#c9d1d9"):
-        self.status_dot.config(fg=color)
-        self.status_text.config(text=text)
+    def _set_status(self, text, color=None):
+        if color is None: color = self.THEME["fg_text"]
+        # Delightr / Harden: ensure updates are thread-safe and resilient
+        try:
+            self.status_dot.config(fg=color)
+            self.status_text.config(text=text)
+        except tk.TclError:
+            pass  # safely ignore if window is destroyed
+
+    def _fade_button_color(self, target_fg, target_bg=None):
+        """Delightr: simple state application (can be expanded to real fades)"""
+        try:
+            bg = target_bg or self.THEME["bg_panel"]
+            self.btn.config(fg=target_fg, bg=bg, activeforeground=target_fg)
+        except tk.TclError:
+            pass
 
     def _log(self, tag, message):
         self.msg_queue.put((tag, message))
 
+    # ── Matrix text animation ─────────────────────────────────────────────
+
     def _check_queue(self):
-        """Drain message queue, update volume meter + Jetson stats.  50 ms tick."""
-        try:
-            while True:
+        """Drain message queue via Matrix-style typing. Resilient polling."""
+        # Only pop a new message if not currently typing one out
+        if not self._matrix_busy:
+            try:
                 tag, msg = self.msg_queue.get_nowait()
-                self.chat.config(state=tk.NORMAL)
+                self._matrix_busy = True
                 if tag == "user":
-                    self.chat.insert(tk.END, f"\nYou: {msg}\n", "user")
+                    self._matrix_type("\nYou: ", msg, "user")
                 elif tag == "wilson":
-                    self.chat.insert(tk.END, f"\nWilson: {msg}\n", "wilson")
+                    self._matrix_type("\nWilson: ", msg, "wilson")
                 else:
-                    self.chat.insert(tk.END, f"\n{msg}\n", "system")
-                self.chat.config(state=tk.DISABLED)
-                self.chat.see(tk.END)
-        except queue.Empty:
-            pass
+                    self._matrix_type("\n", msg, "system")
+            except queue.Empty:
+                pass
 
         # Volume
-        if self.is_listening and self.recorder:
-            self.volume_bar["value"] = min(100, self.recorder.get_volume() * 500)
-        else:
-            self.volume_bar["value"] = 0
+        try:
+            if self.is_listening and self.recorder:
+                current = self.volume_bar["value"]
+                target = min(100, self.recorder.get_volume() * 500)
+                self.volume_bar["value"] = current * 0.3 + target * 0.7
+            else:
+                self.volume_bar["value"] = 0
+        except tk.TclError:
+            pass
 
         # Jetson telemetry
-        if IS_JETSON and hasattr(self, "stats_label"):
-            s = self.monitor.summary
-            if s:
-                self.stats_label.config(text=s)
+        try:
+            if IS_JETSON and hasattr(self, "stats_label"):
+                s = self.monitor.summary
+                if s:
+                    self.stats_label.config(text=s)
+        except Exception:
+            pass
 
-        self.root.after(60, self._check_queue)
+        try:
+            self.root.after(50, self._check_queue)
+        except tk.TclError:
+            pass
+
+    def _matrix_type(self, prefix, text, tag, idx=0):
+        """Type text character-by-character, Matrix rain style."""
+        try:
+            self.chat.config(state=tk.NORMAL)
+            if idx == 0:
+                self.chat.insert(tk.END, prefix, tag)
+            if idx < len(text):
+                self.chat.insert(tk.END, text[idx], tag)
+                self.chat.see(tk.END)
+                self.chat.config(state=tk.DISABLED)
+                # Speed profile: wilson=dramatic, system=fast, user=medium
+                ch = text[idx]
+                if tag == "wilson":
+                    delay = 6 if ch in ' \n' else 22
+                elif tag == "user":
+                    delay = 4 if ch in ' \n' else 12
+                else:
+                    delay = 1  # system messages appear near-instantly
+                self.root.after(delay, self._matrix_type, prefix, text, tag, idx + 1)
+            else:
+                self.chat.insert(tk.END, "\n", tag)
+                self.chat.config(state=tk.DISABLED)
+                self.chat.see(tk.END)
+                self._matrix_busy = False
+        except tk.TclError:
+            self._matrix_busy = False
+
+    # ── Animated Face / Mouth ─────────────────────────────────────────────
+
+    def _draw_face(self):
+        """Draw eyes and mouth on the face canvas."""
+        c = self.face_canvas
+        t = self.THEME
+        c.delete("face")
+
+        cx, cy_eyes = 100, 28
+        eye_sep = 35
+
+        # ── Eyes ──
+        if self._eye_open:
+            # Open eyes (iris ring + dark pupil)
+            for ex in (cx - eye_sep, cx + eye_sep):
+                c.create_oval(ex - 11, cy_eyes - 11, ex + 11, cy_eyes + 11,
+                              fill=t["fg_title"], outline=t["fg_title"], tags="face")
+                c.create_oval(ex - 5, cy_eyes - 5, ex + 5, cy_eyes + 5,
+                              fill=t["bg_main"], outline=t["bg_main"], tags="face")
+        else:
+            # Closed eyes (horizontal lines)
+            for ex in (cx - eye_sep, cx + eye_sep):
+                c.create_line(ex - 11, cy_eyes, ex + 11, cy_eyes,
+                              fill=t["fg_title"], width=3, tags="face")
+
+        # ── Mouth ──
+        cx_m, cy_m = 100, 72
+        mouth_w = 28
+        openness = self._mouth_openness
+
+        if openness < 0.05:
+            # Closed: gentle smile arc
+            c.create_arc(cx_m - mouth_w, cy_m - 10, cx_m + mouth_w, cy_m + 14,
+                         start=200, extent=140, style=tk.ARC,
+                         outline=t["accent_ready"], width=3, tags="face")
+        else:
+            # Open: ellipse grows taller with amplitude
+            h = int(4 + openness * 22)
+            c.create_oval(cx_m - mouth_w, cy_m - h, cx_m + mouth_w, cy_m + h,
+                          fill="#1a0808", outline=t["accent_ready"], width=2, tags="face")
+            # Tongue hint when mouth is wide
+            if openness > 0.55:
+                tw = int(10 + openness * 6)
+                c.create_arc(cx_m - tw, cy_m + 2, cx_m + tw, cy_m + h + 4,
+                             start=0, extent=180,
+                             fill="#c05555", outline="", tags="face")
+
+    def _schedule_blink(self):
+        """Random eye blink loop."""
+        if not self._mouth_active:
+            self._eye_open = False
+            self._draw_face()
+            try:
+                self.root.after(150, self._open_eyes)
+            except tk.TclError:
+                return
+        delay = random.randint(2500, 5500)
+        try:
+            self.root.after(delay, self._schedule_blink)
+        except tk.TclError:
+            pass
+
+    def _open_eyes(self):
+        self._eye_open = True
+        try:
+            self._draw_face()
+        except tk.TclError:
+            pass
+
+    def _compute_mouth_amplitudes(self, audio_data, sr, fps=30):
+        """Pre-compute per-frame RMS amplitudes for mouth sync."""
+        samples_per_frame = max(1, sr // fps)
+        amplitudes = []
+        for i in range(0, len(audio_data), samples_per_frame):
+            chunk = audio_data[i:i + samples_per_frame]
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
+            # Scale to 0-1 range; speech RMS ~0.02-0.15 → multiply to fill range
+            amplitudes.append(min(1.0, rms * 10))
+        return amplitudes
+
+    def _start_mouth_anim(self, amplitudes, duration):
+        """Begin mouth animation synced to TTS audio. Called on main thread."""
+        self._mouth_data = amplitudes
+        self._mouth_start = time.time()
+        self._mouth_duration = duration
+        self._mouth_active = True
+        self._eye_open = True
+        self._tick_mouth()
+
+    def _tick_mouth(self):
+        """30fps mouth update driven by pre-computed amplitude envelope."""
+        if not self._mouth_active:
+            self._mouth_openness = 0.0
+            self._draw_face()
+            return
+        elapsed = time.time() - self._mouth_start
+        if elapsed >= self._mouth_duration or not self._mouth_data:
+            self._stop_mouth_anim()
+            return
+        # Map elapsed time to amplitude array index
+        progress = elapsed / self._mouth_duration
+        idx = int(progress * len(self._mouth_data))
+        idx = min(idx, len(self._mouth_data) - 1)
+        self._mouth_openness = self._mouth_data[idx]
+        self._draw_face()
+        try:
+            self.root.after(33, self._tick_mouth)  # ~30 fps
+        except tk.TclError:
+            pass
+
+    def _stop_mouth_anim(self):
+        """Return mouth to idle smile."""
+        self._mouth_active = False
+        self._mouth_openness = 0.0
+        try:
+            self._draw_face()
+        except tk.TclError:
+            pass
 
     # ── initialization ────────────────────────────────────────────────────────
 
@@ -906,10 +1218,10 @@ class WilsonGUI:
             else:
                 self._log("system", f"Platform: {platform.system()} {platform.machine()}")
 
-            self._log("system", "Initializing microphone\u2026")
+            self._log("system", "Initializing microphone…")
             self.recorder = AudioRecorder()
 
-            self._log("system", "Loading TTS engine\u2026")
+            self._log("system", "Loading TTS engine…")
             self.tts = TTSEngine()
             tts_name = "Piper" if self.tts.has_piper else ("espeak-ng" if self.tts.has_espeak else "NONE")
             self._log("system", f"TTS: {tts_name}")
@@ -920,12 +1232,13 @@ class WilsonGUI:
             if IS_JETSON:
                 gc.collect()
 
-            self._log("system", "Wilson is ready.  Click the button or press Space.")
-            self.root.after(0, lambda: self._set_status("Ready", "#238636"))
+            self._log("system", "Wilson is ready. Click the button or press Space.")
+            self.root.after(0, lambda: self._set_status(self.I18N["status_ready"], self.THEME["accent_ready"]))
+            self.root.after(0, lambda: self._fade_button_color(self.THEME["accent_ready"]))
 
         except Exception as e:
             self._log("system", f"Init error: {e}")
-            self.root.after(0, lambda: self._set_status("Error", "#f85149"))
+            self.root.after(0, lambda: self._set_status(self.I18N["status_error"], self.THEME["accent_listen"]))
 
     # ── listening controls ────────────────────────────────────────────────────
 
@@ -933,7 +1246,7 @@ class WilsonGUI:
         if self.is_processing:
             return
         if self.transcriber is None or self.transcriber.model is None:
-            self._log("system", "Still loading, please wait\u2026")
+            self._log("system", "Still loading, please wait…")
             return
         if self.is_listening:
             self._stop_listening()
@@ -942,8 +1255,9 @@ class WilsonGUI:
 
     def _start_listening(self):
         self.is_listening = True
-        self.btn.config(text="\U0001f534  LISTENING\u2026 (click to stop)", bg="#f85149")
-        self._set_status("Listening\u2026", "#f85149")
+        self.btn.config(text=self.I18N["btn_listen"])
+        self._fade_button_color(self.THEME["accent_listen"])
+        self._set_status(self.I18N["status_dictate"], self.THEME["accent_listen"])
         self.recorder.start()
         threading.Thread(target=self._silence_watchdog, daemon=True).start()
 
@@ -952,8 +1266,9 @@ class WilsonGUI:
             return
         self.is_listening = False
         self.is_processing = True
-        self.btn.config(text="\u231b  PROCESSING\u2026", bg="#f0883e", state=tk.DISABLED)
-        self._set_status("Processing\u2026", "#f0883e")
+        self.btn.config(text=self.I18N["btn_process"], state=tk.DISABLED)
+        self._fade_button_color(self.THEME["accent_process"])
+        self._set_status(self.I18N["status_process"], self.THEME["accent_process"])
         audio = self.recorder.stop()
         if audio is not None and len(audio) > SAMPLE_RATE * 0.5:
             threading.Thread(target=self._process, args=(audio,), daemon=True).start()
@@ -966,12 +1281,16 @@ class WilsonGUI:
         silence = 0.0
         while self.is_listening:
             time.sleep(0.1)
-            if self.recorder.get_volume() < 0.01:
-                silence += 0.1
-            else:
-                silence = 0.0
-            if silence > 2.0 and len(self.recorder.audio_data) > 20:
-                self.root.after(0, self._stop_listening)
+            # Resilient check if window still running
+            try:
+                if self.recorder.get_volume() < 0.01:
+                    silence += 0.1
+                else:
+                    silence = 0.0
+                if silence > 2.0 and len(self.recorder.audio_data) > 20:
+                    self.root.after(0, self._stop_listening)
+                    break
+            except Exception:
                 break
 
     # ── processing pipeline ───────────────────────────────────────────────────
@@ -979,7 +1298,7 @@ class WilsonGUI:
     def _process(self, audio):
         try:
             # STT
-            self.root.after(0, lambda: self._set_status("Transcribing\u2026", "#f0883e"))
+            self.root.after(0, lambda: self._set_status(self.I18N["status_transcribe"], self.THEME["accent_process"]))
             text = self.transcriber.transcribe(audio)
 
             if not text or len(text.strip()) < 2:
@@ -990,13 +1309,22 @@ class WilsonGUI:
             self._log("user", text.strip())
 
             # LLM
-            self.root.after(0, lambda: self._set_status("Thinking\u2026", "#f0883e"))
+            self.root.after(0, lambda: self._set_status(self.I18N["status_think"], self.THEME["accent_process"]))
             response = self.llm.query(text)
             self._log("wilson", response)
 
-            # TTS
-            self.root.after(0, lambda: self._set_status("Speaking\u2026", "#7ee787"))
-            self.tts.speak(response, log_fn=lambda m: self._log("system", m))
+            # TTS with mouth animation
+            self.root.after(0, lambda: self._set_status(self.I18N["status_speak"], self.THEME["accent_ready"]))
+            audio_data, sr = self.tts.generate_wav(response, log_fn=lambda m: self._log("system", m))
+            if audio_data is not None and sr is not None:
+                amps = self._compute_mouth_amplitudes(audio_data, sr)
+                duration = len(audio_data) / sr
+                self.root.after(0, lambda a=amps, d=duration: self._start_mouth_anim(a, d))
+                _get_sd().play(audio_data, sr)
+                _get_sd().wait()
+                self.root.after(0, self._stop_mouth_anim)
+            else:
+                self.tts.speak(response, log_fn=lambda m: self._log("system", m))
 
         except Exception as e:
             self._log("system", f"Pipeline error: {e}")
@@ -1005,26 +1333,37 @@ class WilsonGUI:
 
     def _reset(self):
         self.is_processing = False
-        self.btn.config(
-            text="\U0001f3a4  CLICK TO START LISTENING",
-            bg="#238636", state=tk.NORMAL,
-        )
-        self._set_status("Ready", "#238636")
+        try:
+            self.btn.config(text=self.I18N["btn_ready"], state=tk.NORMAL)
+            self._fade_button_color(self.THEME["accent_ready"])
+            self._set_status(self.I18N["status_ready"], self.THEME["accent_ready"])
+        except tk.TclError:
+            pass
 
     # ── shutdown ──────────────────────────────────────────────────────────────
 
     def shutdown(self):
         self.is_listening = False
-        self.monitor.stop()
+        try:
+            self.monitor.stop()
+        except Exception:
+            pass
+            
         if self.recorder and self.recorder.stream:
             try:
                 self.recorder.stream.close()
             except Exception:
                 pass
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def run(self):
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        except KeyboardInterrupt:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
