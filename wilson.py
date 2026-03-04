@@ -763,37 +763,37 @@ class WilsonGUI:
     Hardened for resilience, localized, and optimized for performance."""
 
     THEME = {
-        "bg_main": "#1e1e2e",         # Modern dark (Catppuccin Macchiato based)
-        "bg_panel": "#181825",
-        "fg_title": "#89b4fa",        # Blue accent
-        "fg_text": "#cad3f5",         # Main text
-        "fg_sub": "#a5adcb",          # Subtext
-        "accent_ready": "#a6da95",    # Green
-        "accent_ready_hover": "#8bd5ca",
-        "accent_listen": "#ed8796",   # Red
-        "accent_process": "#f5a97f",  # Orange
-        "color_user": "#8aa2f8",
-        "color_wilson": "#a6da95",
-        "color_system": "#5b6078",
+        "bg_main": "#000000",         # Pure black — black hole core
+        "bg_panel": "#020402",        # Near-black with faint green tint
+        "fg_title": "#00ff41",        # Matrix phosphor green
+        "fg_text": "#00ff41",         # Matrix green
+        "fg_sub": "#00cc33",          # Dimmer Matrix green
+        "accent_ready": "#00ff41",    # Matrix green
+        "accent_ready_hover": "#33ff66",
+        "accent_listen": "#ff0040",   # Red alert
+        "accent_process": "#00cc33",  # Processing green
+        "color_user": "#00ff41",      # Matrix green for user
+        "color_wilson": "#00ff41",    # Matrix green for Wilson
+        "color_system": "#004d1a",    # Dark green for system
     }
 
     I18N = {
         "title": "WILSON V1",
-        "subtitle": "Offline Voice Assistant",
-        "btn_ready": "🎤 CLICK TO START LISTENING",
-        "btn_listen": "🔴 LISTENING… (click to stop)",
-        "btn_process": "⌛ PROCESSING…",
-        "status_init": "Initializing…",
-        "status_ready": "Ready",
-        "status_dictate": "Listening…",
-        "status_process": "Processing…",
-        "status_transcribe": "Transcribing…",
-        "status_think": "Thinking…",
-        "status_speak": "Speaking…",
-        "status_error": "Error",
-        "telemetry_load": "Telemetry loading…",
-        "volume": "Volume:",
-        "footer_hints": "Spacebar or click • Auto-stops on silence"
+        "subtitle": "OFFLINE VOICE ASSISTANT",
+        "btn_ready": "> INITIATE TRANSMISSION",
+        "btn_listen": "> SIGNAL ACTIVE...",
+        "btn_process": "> DECODING...",
+        "status_init": "LOADING...",
+        "status_ready": "AWAITING INPUT",
+        "status_dictate": "RECEIVING...",
+        "status_process": "PROCESSING...",
+        "status_transcribe": "DECODING SIGNAL...",
+        "status_think": "COMPUTING...",
+        "status_speak": "TRANSMITTING...",
+        "status_error": "ERROR",
+        "telemetry_load": "TELEMETRY LOADING...",
+        "volume": "SIG:",
+        "footer_hints": "[SPACE] or click  |  auto-stops on silence"
     }
 
     def __init__(self):
@@ -802,7 +802,7 @@ class WilsonGUI:
         
         # Transparent Circular Window setup
         self._transparent_key = "#000001"
-        self.root.geometry("700x700")
+        self.root.geometry("800x800")
         self.root.configure(bg=self._transparent_key)
         
         if IS_WINDOWS:
@@ -826,6 +826,13 @@ class WilsonGUI:
 
         # Matrix text animation state
         self._matrix_busy = False
+        self._pending_wilson_text = None   # holds wilson text to sync with TTS
+        self._matrix_rain_chars = []       # falling rain columns
+
+        # Matrix audio visualizer state
+        self._viz_bars = 24          # number of frequency bars
+        self._viz_levels = [0.0] * 24
+        self._viz_particles = []     # list of (x, y, speed, brightness)
 
         # Mouth / face animation state
         self._mouth_active = False
@@ -836,10 +843,10 @@ class WilsonGUI:
         self._eye_open = True
 
         # Cache formatting elements for optimization
-        self._font_title = (FONT_UI, 24, "bold")
-        self._font_sub = (FONT_UI, 10)
+        self._font_title = (FONT_MONO, 22, "bold")
+        self._font_sub = (FONT_MONO, 9)
         self._font_mono = (FONT_MONO, 10)
-        self._font_btn = (FONT_UI, 13, "bold")
+        self._font_btn = (FONT_MONO, 12, "bold")
 
         self._build_ui()
         self._check_queue()
@@ -866,32 +873,34 @@ class WilsonGUI:
         self.bg_canvas = tk.Canvas(self.root, bg=self._transparent_key, highlightthickness=0)
         self.bg_canvas.pack(fill=tk.BOTH, expand=True)
         
-        # Create outer circle with breathing room
-        self.bg_canvas.create_oval(25, 25, 675, 675, fill=t["bg_main"], outline=t["fg_title"], width=3)
+        # Create outer circle — black hole event horizon
+        self.bg_canvas.create_oval(10, 10, 790, 790, fill=t["bg_main"], outline=t["fg_title"], width=2)
+        # Inner glow ring
+        self.bg_canvas.create_oval(20, 20, 780, 780, fill="", outline="#003300", width=1)
         
         # Bind left-click and drag events to canvas for window movement
         self.bg_canvas.bind("<ButtonPress-1>", self._start_drag)
         self.bg_canvas.bind("<B1-Motion>", self._on_drag)
 
-        # Central container restricted closely inside the circle to avoid cutoff
+        # Central container — firmly inscribed inside circle to prevent corner spikes
         self.main_container = tk.Frame(self.root, bg=t["bg_main"])
-        self.main_container.place(relx=0.5, rely=0.5, anchor="center", width=480, height=570)
+        self.main_container.place(relx=0.5, rely=0.5, anchor="center", width=460, height=560)
 
         subtitle = JETSON_MODEL if IS_JETSON else i18n["subtitle"]
 
         # Header with drag & close actions explicitly mapped
         top_frame = tk.Frame(self.main_container, bg=t["bg_main"])
-        top_frame.pack(fill=tk.X, pady=(0, 5))
+        top_frame.pack(fill=tk.X, pady=(0, 3))
         
-        close_btn = tk.Label(top_frame, text="✕", font=(FONT_UI, 14, "bold"), fg=t["accent_listen"], bg=t["bg_main"], cursor="hand2")
+        close_btn = tk.Label(top_frame, text="[X]", font=(FONT_MONO, 11, "bold"), fg=t["accent_listen"], bg=t["bg_main"], cursor="hand2")
         close_btn.pack(side=tk.RIGHT, padx=5)
         close_btn.bind("<Button-1>", lambda e: self.shutdown())
 
         tk.Label(
-            self.main_container, text=f"◈ {i18n['title']} ◈",
+            self.main_container, text=f"[ {i18n['title']} ]",
             font=self._font_title,
             fg=t["fg_title"], bg=t["bg_main"],
-        ).pack(pady=(0, 5))
+        ).pack(pady=(0, 3))
 
         tk.Label(
             self.main_container, text=subtitle,
@@ -920,80 +929,92 @@ class WilsonGUI:
 
         # Status indicator
         sf = tk.Frame(self.main_container, bg=t["bg_main"])
-        sf.pack(pady=10)
+        sf.pack(pady=(6, 0))
 
         self.status_dot = tk.Label(
-            sf, text="●", font=(FONT_UI, 18),
+            sf, text="●", font=(FONT_MONO, 14),
             fg=t["accent_process"], bg=t["bg_main"],
         )
         self.status_dot.pack(side=tk.LEFT)
 
         self.status_text = tk.Label(
             sf, text=i18n["status_init"],
-            font=(FONT_UI, 12), fg=t["fg_text"], bg=t["bg_main"],
+            font=(FONT_MONO, 11), fg=t["fg_text"], bg=t["bg_main"],
         )
         self.status_text.pack(side=tk.LEFT, padx=(8, 0))
 
-        # Volume meter
-        vf = tk.Frame(self.main_container, bg=t["bg_main"])
-        vf.pack(pady=(0, 10))
-
-        tk.Label(
-            vf, text=i18n["volume"], font=(FONT_UI, 10),
-            fg=t["fg_sub"], bg=t["bg_main"],
-        ).pack(side=tk.LEFT)
-
-        self.volume_bar = ttk.Progressbar(
-            vf, length=180, mode="determinate", maximum=100,
+        # ── Matrix Audio Visualizer (replaces boring progress bar) ────────
+        self.viz_canvas = tk.Canvas(
+            self.main_container, width=340, height=36,
+            bg="#000000", highlightthickness=0,
         )
-        self.volume_bar.pack(side=tk.LEFT, padx=8)
+        self.viz_canvas.pack(pady=(4, 6))
+        self._draw_viz_idle()
 
-        # Chat log (Robust text overflow handling via wrap)
-        cf = tk.Frame(self.main_container, bg=t["bg_panel"], padx=3, pady=3)
-        cf.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
+        # Chat log — Matrix terminal (no scrollbar, pure black)
+        cf = tk.Frame(self.main_container, bg="#000000", padx=0, pady=0)
+        cf.pack(padx=10, pady=4, fill=tk.BOTH, expand=True)
 
-        self.chat = scrolledtext.ScrolledText(
+        self.chat = tk.Text(
             cf, font=self._font_mono,
-            bg=t["bg_main"], fg=t["fg_text"],
+            bg="#000000", fg=t["fg_text"],
             wrap=tk.WORD, state=tk.DISABLED,
-            relief=tk.FLAT, padx=12, pady=12,
+            relief=tk.FLAT, padx=10, pady=8,
+            borderwidth=0, highlightthickness=0,
+            insertbackground=t["fg_title"],
+            selectbackground="#003300",
+            selectforeground=t["fg_title"],
+            cursor="arrow",
         )
-        self.chat.pack(fill=tk.BOTH, expand=True)
-        self.chat.tag_configure("user",   foreground=t["color_user"])
-        self.chat.tag_configure("wilson", foreground=t["color_wilson"], spacing1=4, spacing3=4)
-        self.chat.tag_configure("system", foreground=t["color_system"], justify=tk.CENTER)
+        self.chat.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Listen button (Delightr: larger, more padding, distinct colors)
+        # Thin Matrix scroll indicator (canvas-drawn, no native scrollbar)
+        self.scroll_indicator = tk.Canvas(
+            cf, width=6, bg="#000000", highlightthickness=0,
+        )
+        self.scroll_indicator.pack(side=tk.RIGHT, fill=tk.Y)
+        self.chat.config(yscrollcommand=self._update_scroll_indicator)
+        # Enable mouse wheel scrolling
+        self.chat.bind("<MouseWheel>", self._on_chat_scroll)
+        self.chat.bind("<Button-4>", self._on_chat_scroll)
+        self.chat.bind("<Button-5>", self._on_chat_scroll)
+
+        self.chat.tag_configure("user",   foreground="#00cc33", font=(FONT_MONO, 10))
+        self.chat.tag_configure("wilson", foreground="#00ff41", font=(FONT_MONO, 10, "bold"), spacing1=4, spacing3=4)
+        self.chat.tag_configure("system", foreground="#004d1a", font=(FONT_MONO, 9), justify=tk.CENTER)
+        self.chat.tag_configure("cursor_blink", foreground="#00ff41", font=(FONT_MONO, 10, "bold"))
+
+        # Listen button — Matrix style
         self.btn = tk.Button(
             self.main_container,
             text=i18n["btn_ready"],
             font=self._font_btn,
-            bg=t["bg_panel"], fg=t["accent_ready"],
-            activebackground=t["bg_panel"], activeforeground=t["accent_ready_hover"],
-            highlightthickness=1, highlightbackground=t["accent_ready"],
-            relief=tk.FLAT, width=28, height=2,
+            bg="#000000", fg=t["accent_ready"],
+            activebackground="#001a00", activeforeground=t["accent_ready_hover"],
+            highlightthickness=1, highlightbackground="#003300",
+            relief=tk.FLAT, width=26, height=1,
             cursor="hand2",
             command=self._toggle_listening,
         )
-        self.btn.pack(pady=10)
+        self.btn.pack(pady=(6, 4))
         self.root.bind("<space>", lambda e: self._toggle_listening())
 
-        # Footer
+        # Footer — Matrix terminal info
         _llm_name = "LM Studio" if IS_WINDOWS else "Ollama"
         cfg = (
-            f"STT: Whisper {WHISPER_MODEL} ({WHISPER_DEVICE})  ·  "
-            f"LLM: {_llm_name}"
+            f"STT:{WHISPER_MODEL}({WHISPER_DEVICE}) | "
+            f"LLM:{_llm_name}"
         )
         tk.Label(
             self.main_container, text=cfg,
-            font=(FONT_UI, 8), fg=t["color_system"], bg=t["bg_main"],
+            font=(FONT_MONO, 7), fg="#003300", bg=t["bg_main"],
         ).pack()
 
         tk.Label(
             self.main_container,
-            text=i18n["footer_hints"] + " • ESC to quit",
-            font=(FONT_UI, 9), fg=t["color_system"], bg=t["bg_main"],
-        ).pack(pady=(2, 10))
+            text=i18n["footer_hints"] + "  |  [ESC] quit",
+            font=(FONT_MONO, 7), fg="#004d1a", bg=t["bg_main"],
+        ).pack(pady=(1, 4))
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -1007,15 +1028,154 @@ class WilsonGUI:
             pass  # safely ignore if window is destroyed
 
     def _fade_button_color(self, target_fg, target_bg=None):
-        """Delightr: simple state application (can be expanded to real fades)"""
+        """Matrix-style state transition for button."""
         try:
-            bg = target_bg or self.THEME["bg_panel"]
+            bg = target_bg or "#000000"
             self.btn.config(fg=target_fg, bg=bg, activeforeground=target_fg)
         except tk.TclError:
             pass
 
     def _log(self, tag, message):
         self.msg_queue.put((tag, message))
+
+    # ── Matrix Audio Visualizer ───────────────────────────────────────────
+
+    def _draw_viz_idle(self):
+        """Draw a dormant equalizer — dim static bars."""
+        c = self.viz_canvas
+        c.delete("all")
+        w = 340
+        n = self._viz_bars
+        bar_w = max(2, (w - (n - 1) * 3) // n)
+        for i in range(n):
+            x = i * (bar_w + 3) + 4
+            h = 2
+            c.create_rectangle(x, 34 - h, x + bar_w, 34,
+                               fill="#002200", outline="", tags="bars")
+
+    def _draw_viz_active(self):
+        """Draw the live Matrix equalizer with glowing bars + falling particles."""
+        c = self.viz_canvas
+        c.delete("all")
+        w = 340
+        n = self._viz_bars
+        bar_w = max(2, (w - (n - 1) * 3) // n)
+
+        for i in range(n):
+            x = i * (bar_w + 3) + 4
+            level = self._viz_levels[i]
+            h = max(2, int(level * 30))
+
+            # Multi-shade bar: brighter at the top
+            if h > 15:
+                # Hot section
+                c.create_rectangle(x, 34 - h, x + bar_w, 34 - h + 4,
+                                   fill="#00ff41", outline="")
+                c.create_rectangle(x, 34 - h + 4, x + bar_w, 34,
+                                   fill="#00aa2a", outline="")
+            elif h > 6:
+                c.create_rectangle(x, 34 - h, x + bar_w, 34,
+                                   fill="#00882a", outline="")
+            else:
+                c.create_rectangle(x, 34 - h, x + bar_w, 34,
+                                   fill="#004d1a", outline="")
+
+            # Peak dot floating above bar
+            if level > 0.3:
+                peak_y = 34 - h - 3
+                c.create_rectangle(x, peak_y, x + bar_w, peak_y + 2,
+                                   fill="#00ff41", outline="")
+
+        # Draw falling particles
+        new_particles = []
+        for px, py, spd, br in self._viz_particles:
+            py += spd
+            br -= 0.02
+            if br > 0 and py < 36:
+                g = int(br * 255)
+                color = f"#00{g:02x}{g // 4:02x}"
+                c.create_text(px, py, text=random.choice("01"), fill=color,
+                              font=(FONT_MONO, 7), anchor="nw")
+                new_particles.append((px, py, spd, br))
+        self._viz_particles = new_particles
+
+    def _update_viz_from_volume(self):
+        """Update visualizer levels from current mic volume. Called from _check_queue."""
+        if self.is_listening and self.recorder:
+            vol = min(1.0, self.recorder.get_volume() * 12)
+            # Generate frequency-like distribution from mono volume
+            for i in range(self._viz_bars):
+                # Each bar gets a slightly randomized version of the volume
+                target = vol * random.uniform(0.3, 1.0)
+                # Smooth towards target
+                self._viz_levels[i] = self._viz_levels[i] * 0.3 + target * 0.7
+
+            # Spawn particles from the loudest bars
+            if vol > 0.15:
+                n = self._viz_bars
+                bar_w = max(2, (340 - (n - 1) * 3) // n)
+                for i in range(n):
+                    if self._viz_levels[i] > 0.5 and random.random() < 0.3:
+                        x = i * (bar_w + 3) + 4
+                        h = int(self._viz_levels[i] * 30)
+                        self._viz_particles.append(
+                            (x, 34 - h - 5, random.uniform(0.8, 2.0), random.uniform(0.5, 1.0))
+                        )
+                # Cap particles
+                if len(self._viz_particles) > 60:
+                    self._viz_particles = self._viz_particles[-40:]
+
+            self._draw_viz_active()
+        else:
+            # Decay bars smoothly to zero
+            any_active = False
+            for i in range(self._viz_bars):
+                self._viz_levels[i] *= 0.85
+                if self._viz_levels[i] > 0.01:
+                    any_active = True
+            if any_active:
+                self._draw_viz_active()
+            else:
+                self._draw_viz_idle()
+
+    # ── Custom Scroll Indicator ───────────────────────────────────────────
+
+    def _update_scroll_indicator(self, first, last):
+        """Draw a thin Matrix-green scroll position indicator."""
+        c = self.scroll_indicator
+        c.delete("all")
+        first_f = float(first)
+        last_f = float(last)
+        if last_f - first_f >= 0.999:
+            # All content visible, no indicator needed
+            return
+        h = c.winfo_height()
+        if h < 10:
+            h = 200  # fallback before widget is rendered
+        y1 = int(first_f * h)
+        y2 = int(last_f * h)
+        y2 = max(y2, y1 + 12)  # minimum thumb size
+        # Glow track line
+        c.create_line(3, 0, 3, h, fill="#001a00", width=1)
+        # Thumb
+        c.create_rectangle(1, y1, 5, y2, fill="#00ff41", outline="#003300")
+
+    def _on_chat_scroll(self, event):
+        """Handle mouse wheel scrolling in the chat."""
+        if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+            self.chat.yview_scroll(-3, "units")
+        elif event.num == 5 or (hasattr(event, 'delta') and event.delta < 0):
+            self.chat.yview_scroll(3, "units")
+
+    def _insert_separator(self):
+        """Insert a dim separator line to visually mark new conversation turns."""
+        try:
+            self.chat.config(state=tk.NORMAL)
+            self.chat.insert(tk.END, "\n" + "─" * 44 + "\n", "system")
+            self.chat.config(state=tk.DISABLED)
+            self.chat.see(tk.END)
+        except tk.TclError:
+            pass
 
     # ── Matrix text animation ─────────────────────────────────────────────
 
@@ -1027,22 +1187,19 @@ class WilsonGUI:
                 tag, msg = self.msg_queue.get_nowait()
                 self._matrix_busy = True
                 if tag == "user":
-                    self._matrix_type("\nYou: ", msg, "user")
+                    # New conversation turn — add separator, then user text
+                    self._insert_separator()
+                    self._matrix_type("\n> ", msg, "user")
                 elif tag == "wilson":
-                    self._matrix_type("\nWilson: ", msg, "wilson")
+                    self._matrix_type("\n[WILSON] ", msg, "wilson")
                 else:
-                    self._matrix_type("\n", msg, "system")
+                    self._matrix_type("\n  ", msg, "system")
             except queue.Empty:
                 pass
 
-        # Volume
+        # Matrix audio visualizer update
         try:
-            if self.is_listening and self.recorder:
-                current = self.volume_bar["value"]
-                target = min(100, self.recorder.get_volume() * 500)
-                self.volume_bar["value"] = current * 0.3 + target * 0.7
-            else:
-                self.volume_bar["value"] = 0
+            self._update_viz_from_volume()
         except tk.TclError:
             pass
 
@@ -1061,21 +1218,32 @@ class WilsonGUI:
             pass
 
     def _matrix_type(self, prefix, text, tag, idx=0):
-        """Type text character-by-character, Matrix rain style."""
+        """Type text character-by-character, Matrix rain style with
+        randomized glitch characters that resolve into final text."""
         try:
             self.chat.config(state=tk.NORMAL)
             if idx == 0:
                 self.chat.insert(tk.END, prefix, tag)
             if idx < len(text):
-                self.chat.insert(tk.END, text[idx], tag)
+                ch = text[idx]
+                # Matrix glitch: briefly show a random character before the real one
+                if tag == "wilson" and ch not in ' \n' and random.random() < 0.4:
+                    glitch_chars = "01アイウエオカキクケコサシスセソ$#@&%"
+                    glitch = random.choice(glitch_chars)
+                    self.chat.insert(tk.END, glitch, tag)
+                    self.chat.see(tk.END)
+                    self.chat.config(state=tk.DISABLED)
+                    # Schedule replacement of glitch with real char
+                    self.root.after(40, self._resolve_glitch, text, tag, idx)
+                    return
+                self.chat.insert(tk.END, ch, tag)
                 self.chat.see(tk.END)
                 self.chat.config(state=tk.DISABLED)
                 # Speed profile: wilson=dramatic, system=fast, user=medium
-                ch = text[idx]
                 if tag == "wilson":
-                    delay = 6 if ch in ' \n' else 22
+                    delay = 4 if ch in ' \n' else 18
                 elif tag == "user":
-                    delay = 4 if ch in ' \n' else 12
+                    delay = 3 if ch in ' \n' else 10
                 else:
                     delay = 1  # system messages appear near-instantly
                 self.root.after(delay, self._matrix_type, prefix, text, tag, idx + 1)
@@ -1087,10 +1255,30 @@ class WilsonGUI:
         except tk.TclError:
             self._matrix_busy = False
 
+    def _resolve_glitch(self, text, tag, idx):
+        """Replace glitch character with the real character."""
+        try:
+            self.chat.config(state=tk.NORMAL)
+            # Delete the last character (the glitch) and insert the real one
+            self.chat.delete("end-2c", "end-1c")
+            self.chat.insert("end-1c", text[idx], tag)
+            self.chat.see(tk.END)
+            self.chat.config(state=tk.DISABLED)
+            ch = text[idx]
+            if tag == "wilson":
+                delay = 4 if ch in ' \n' else 18
+            elif tag == "user":
+                delay = 3 if ch in ' \n' else 10
+            else:
+                delay = 1
+            self.root.after(delay, self._matrix_type, "", text, tag, idx + 1)
+        except tk.TclError:
+            self._matrix_busy = False
+
     # ── Animated Face / Mouth ─────────────────────────────────────────────
 
     def _draw_face(self):
-        """Draw eyes and mouth on the face canvas."""
+        """Draw eyes and mouth on the face canvas — Matrix / black hole style."""
         c = self.face_canvas
         t = self.THEME
         c.delete("face")
@@ -1098,41 +1286,36 @@ class WilsonGUI:
         cx, cy_eyes = 100, 28
         eye_sep = 35
 
-        # ── Eyes ──
+        # ── Eyes ── (Matrix green, hollow)
         if self._eye_open:
-            # Open eyes (iris ring + dark pupil)
             for ex in (cx - eye_sep, cx + eye_sep):
                 c.create_oval(ex - 11, cy_eyes - 11, ex + 11, cy_eyes + 11,
-                              fill=t["fg_title"], outline=t["fg_title"], tags="face")
+                              fill="#00ff41", outline="#00ff41", tags="face")
                 c.create_oval(ex - 5, cy_eyes - 5, ex + 5, cy_eyes + 5,
-                              fill=t["bg_main"], outline=t["bg_main"], tags="face")
+                              fill="#000000", outline="#000000", tags="face")
         else:
-            # Closed eyes (horizontal lines)
             for ex in (cx - eye_sep, cx + eye_sep):
                 c.create_line(ex - 11, cy_eyes, ex + 11, cy_eyes,
-                              fill=t["fg_title"], width=3, tags="face")
+                              fill="#00ff41", width=3, tags="face")
 
-        # ── Mouth ──
+        # ── Mouth ── (Matrix green outline)
         cx_m, cy_m = 100, 72
         mouth_w = 28
         openness = self._mouth_openness
 
         if openness < 0.05:
-            # Closed: gentle smile arc
             c.create_arc(cx_m - mouth_w, cy_m - 10, cx_m + mouth_w, cy_m + 14,
                          start=200, extent=140, style=tk.ARC,
-                         outline=t["accent_ready"], width=3, tags="face")
+                         outline="#00ff41", width=3, tags="face")
         else:
-            # Open: ellipse grows taller with amplitude
             h = int(4 + openness * 22)
             c.create_oval(cx_m - mouth_w, cy_m - h, cx_m + mouth_w, cy_m + h,
-                          fill="#1a0808", outline=t["accent_ready"], width=2, tags="face")
-            # Tongue hint when mouth is wide
+                          fill="#000800", outline="#00ff41", width=2, tags="face")
             if openness > 0.55:
                 tw = int(10 + openness * 6)
                 c.create_arc(cx_m - tw, cy_m + 2, cx_m + tw, cy_m + h + 4,
                              start=0, extent=180,
-                             fill="#c05555", outline="", tags="face")
+                             fill="#003300", outline="", tags="face")
 
     def _schedule_blink(self):
         """Random eye blink loop."""
@@ -1311,19 +1494,21 @@ class WilsonGUI:
             # LLM
             self.root.after(0, lambda: self._set_status(self.I18N["status_think"], self.THEME["accent_process"]))
             response = self.llm.query(text)
-            self._log("wilson", response)
 
-            # TTS with mouth animation
+            # TTS with mouth animation — text appears in sync with speech
             self.root.after(0, lambda: self._set_status(self.I18N["status_speak"], self.THEME["accent_ready"]))
             audio_data, sr = self.tts.generate_wav(response, log_fn=lambda m: self._log("system", m))
             if audio_data is not None and sr is not None:
                 amps = self._compute_mouth_amplitudes(audio_data, sr)
                 duration = len(audio_data) / sr
+                # Queue the wilson text to appear AS speech plays (synced with audio)
+                self._log("wilson", response)
                 self.root.after(0, lambda a=amps, d=duration: self._start_mouth_anim(a, d))
                 _get_sd().play(audio_data, sr)
                 _get_sd().wait()
                 self.root.after(0, self._stop_mouth_anim)
             else:
+                self._log("wilson", response)
                 self.tts.speak(response, log_fn=lambda m: self._log("system", m))
 
         except Exception as e:
