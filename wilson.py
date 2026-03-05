@@ -342,49 +342,158 @@ def set_jetson_power_mode(mode="MAXN"):
 class AudioRecorder:
     """
     Records audio from the best available microphone using sounddevice.
-    Works with USB mics on both Windows and Jetson.
+    Prefers external / Bluetooth devices over built-in mics.
+    Opens the stream at the device's native sample rate and resamples
+    to 16 kHz on stop() so Whisper always gets what it expects.
     """
+
+    # Keywords for preferred external mics (matched case-insensitively)
+    PREFERRED_KEYWORDS = [
+        "anker", "powerconf", "poweranc", "respeaker", "seeed",
+        "jabra", "blue yeti", "rode", "fifine", "amd bluetooth",
+    ]
+
+    # Automatic gain: if the recorded peak is below this we boost the signal.
+    # Bluetooth HFP mics on Windows often deliver -60 dB signals through
+    # the MME Sound Mapper (PortAudio can't open the device directly).
+    _AGC_TARGET_PEAK = 0.5
+    _AGC_MIN_PEAK    = 0.002   # anything below this is treated as silence
+
+    # Host-API preference on Windows — DirectSound handles Bluetooth resampling
+    # better than WASAPI (which often locks to a single rate on BT headsets)
+    _HOSTAPI_RANK = {"Windows DirectSound": 0, "Windows WASAPI": 1, "MME": 2, "Windows WDM-KS": 3}
 
     def __init__(self):
         self.is_recording = False
         self.audio_data   = []
         self.stream       = None
+        self._native_sr   = SAMPLE_RATE    # will be set by _find_device
+        self._all_candidates = []          # ordered list of (device_id, sr, label) to try
+        self._live_gain   = 1.0            # real-time gain for get_volume(); set after start()
         self.device_id    = self._find_device()
 
+    # ── device selection ──────────────────────────────────────────────────────
+
     def _find_device(self):
-        devices = _get_sd().query_devices()
+        sd = _get_sd()
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
 
-        # Priority 1: known high-quality USB mics
-        preferred = [
-            "anker", "powerconf", "respeaker", "seeed",
-            "jabra", "blue yeti", "rode", "fifine",
-        ]
+        # Build a hostapi name lookup
+        api_names = {i: h["name"] for i, h in enumerate(hostapis)}
+
+        # ── Collect all input devices grouped by name ──
+        # For each unique device name, pick the best host-API variant
+        by_name = {}   # base_name → list of (hostapi_rank, device_index, device_info)
         for i, d in enumerate(devices):
-            if d["max_input_channels"] > 0:
-                name = d["name"].lower()
-                if any(k in name for k in preferred):
-                    print(f"[MIC] Preferred: {d['name']}")
-                    return i
+            if d["max_input_channels"] <= 0:
+                continue
+            api = api_names.get(d["hostapi"], "")
+            rank = self._HOSTAPI_RANK.get(api, 99)
+            base = d["name"].strip()
+            by_name.setdefault(base, []).append((rank, i, d))
 
-        # Priority 2: any USB audio device
+        # Sort each group so best host-API comes first
+        for name in by_name:
+            by_name[name].sort(key=lambda t: t[0])
+
+        # ── Build a prioritised candidate list ──
+        # We'll try all of these in order in start() if the top pick fails.
+        candidates = []
+        seen_ids = set()
+
+        def _add_candidates(base_name, label):
+            for rank, idx, info in by_name.get(base_name, []):
+                if idx in seen_ids:
+                    continue
+                seen_ids.add(idx)
+                sr = self._pick_samplerate(idx, info.get("default_samplerate", SAMPLE_RATE))
+                api = api_names.get(info["hostapi"], "?")
+                candidates.append((idx, int(sr), f"{label}: {info['name']} (id {idx}, {api}, {int(sr)} Hz)"))
+
+        # Priority 1: preferred external mics
+        for base_name in by_name:
+            if any(k in base_name.lower() for k in self.PREFERRED_KEYWORDS):
+                _add_candidates(base_name, "Preferred")
+
+        # Priority 2: Bluetooth devices
+        for base_name in by_name:
+            lower = base_name.lower()
+            if "bluetooth" in lower or "bt " in lower or "headset" in lower:
+                _add_candidates(base_name, "Bluetooth")
+
+        # Priority 3: USB devices
+        for base_name in by_name:
+            if "usb" in base_name.lower():
+                _add_candidates(base_name, "USB")
+
+        # Priority 4: MME Sound Mapper (id 0) — on Windows this routes to
+        # whatever the OS default input device is.  Crucial fallback for
+        # Bluetooth mics that PortAudio can't open directly but Windows
+        # can route through the mapper.
+        try:
+            mapper_info = sd.query_devices(0)
+            mapper_api = api_names.get(mapper_info["hostapi"], "?")
+            if (mapper_info["max_input_channels"] > 0
+                    and "mme" in mapper_api.lower()
+                    and 0 not in seen_ids):
+                mapper_sr = 16000  # Sound Mapper handles resampling
+                candidates.append((0, mapper_sr,
+                    f"SoundMapper: {mapper_info['name']} (id 0, {mapper_api}, {mapper_sr} Hz)"))
+                seen_ids.add(0)
+        except Exception:
+            pass
+
+        # Priority 5: system default
+        default = sd.default.device[0]
+        if default is not None and default >= 0 and default not in seen_ids:
+            info = sd.query_devices(default)
+            sr = int(info.get("default_samplerate", SAMPLE_RATE))
+            api = api_names.get(info["hostapi"], "?")
+            candidates.append((default, sr, f"Default: {info['name']} (id {default}, {api}, {sr} Hz)"))
+            seen_ids.add(default)
+
+        # Priority 6: any remaining input device
         for i, d in enumerate(devices):
-            if d["max_input_channels"] > 0 and "usb" in d["name"].lower():
-                print(f"[MIC] USB: {d['name']}")
-                return i
+            if d["max_input_channels"] > 0 and i not in seen_ids:
+                sr = int(d.get("default_samplerate", SAMPLE_RATE))
+                api = api_names.get(d["hostapi"], "?")
+                candidates.append((i, sr, f"Fallback: {d['name']} (id {i}, {api}, {sr} Hz)"))
+                seen_ids.add(i)
 
-        # Priority 3: system default
-        default = _get_sd().default.device[0]
-        if default is not None and default >= 0:
-            print(f"[MIC] Default: {_get_sd().query_devices(default)['name']}")
-            return default
+        self._all_candidates = candidates
+        if not candidates:
+            raise RuntimeError("No microphone found")
 
-        # Priority 4: first available input
-        for i, d in enumerate(devices):
-            if d["max_input_channels"] > 0:
-                print(f"[MIC] Fallback: {d['name']}")
-                return i
+        # Return the top candidate as default
+        top_id, top_sr, top_label = candidates[0]
+        self._native_sr = top_sr
+        print(f"[MIC] {top_label}")
+        return top_id
 
-        raise RuntimeError("No microphone found")
+    def _pick_samplerate(self, device_idx, reported_sr):
+        """Choose a workable sample rate.  Prefer 16000 Hz (Whisper's native
+        rate) to avoid resampling.  Fall back to the device's reported rate."""
+        reported_sr = int(reported_sr)
+        # If the device natively supports 16k, use it (no resampling needed)
+        if reported_sr == SAMPLE_RATE:
+            return SAMPLE_RATE
+        try:
+            _get_sd().check_input_settings(device=device_idx, samplerate=SAMPLE_RATE, channels=1)
+            return SAMPLE_RATE
+        except Exception:
+            pass
+        # 16k not available — use the reported rate (we'll resample in stop())
+        if reported_sr >= 8000:
+            return reported_sr
+        # Suspiciously low — probe common rates
+        for sr in [44100, 48000, 22050, 8000]:
+            try:
+                _get_sd().check_input_settings(device=device_idx, samplerate=sr, channels=1)
+                return sr
+            except Exception:
+                continue
+        return reported_sr
 
     # ── callbacks ─────────────────────────────────────────────────────────────
 
@@ -397,9 +506,39 @@ class AudioRecorder:
     def start(self):
         self.audio_data = []
         self.is_recording = True
+        self._live_gain = 1.0  # reset; will be updated if using Sound Mapper
+
+        # Walk the prioritised candidate list — try each device + rate until
+        # one actually opens.  This handles disconnected Bluetooth gracefully.
+        last_err = None
+        for dev_id, sr, label in self._all_candidates:
+            # Try the candidate's preferred rate, then fallback rates
+            for try_sr in dict.fromkeys([sr, 16000, 44100, 48000]):
+                try:
+                    self._open_stream(dev_id, try_sr)
+                    if dev_id != self.device_id or try_sr != self._native_sr:
+                        print(f"[MIC] Opened → {label}"
+                              + (f" (at {try_sr} Hz)" if try_sr != sr else ""))
+                    self.device_id = dev_id
+                    self._native_sr = try_sr
+
+                    # Sound Mapper routing a Bluetooth mic delivers ~-60 dB.
+                    # Pre-set a high gain so get_volume() and auto-listen
+                    # thresholds work correctly in real time.
+                    if "soundmapper" in label.lower() or "sound mapper" in label.lower():
+                        self._live_gain = 1000.0   # ~60 dB boost
+                        print(f"[MIC] Sound Mapper detected — live gain ×{self._live_gain:.0f}")
+                    return
+                except Exception as e:
+                    last_err = e
+                    continue
+
+        raise RuntimeError(f"Could not open any microphone. Last error: {last_err}")
+
+    def _open_stream(self, target_device, samplerate):
         self.stream = _get_sd().InputStream(
-            device=self.device_id,
-            samplerate=SAMPLE_RATE,
+            device=target_device,
+            samplerate=samplerate,
             channels=1,
             dtype="float32",
             blocksize=1024,
@@ -415,13 +554,41 @@ class AudioRecorder:
             self.stream = None
         if not self.audio_data:
             return None
-        return np.concatenate(self.audio_data, axis=0).flatten()
+        audio = np.concatenate(self.audio_data, axis=0).flatten()
+
+        # Resample to 16 kHz if the mic's native rate differs (Whisper needs 16k)
+        if self._native_sr != SAMPLE_RATE:
+            try:
+                # Use scipy if available (high quality)
+                from scipy.signal import resample
+                num_samples = int(len(audio) * SAMPLE_RATE / self._native_sr)
+                audio = resample(audio, num_samples).astype(np.float32)
+            except ImportError:
+                # Simple linear interpolation fallback
+                indices = np.linspace(0, len(audio) - 1,
+                                      int(len(audio) * SAMPLE_RATE / self._native_sr))
+                audio = np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+
+        # ── Automatic gain normalisation ──────────────────────────────────
+        # Bluetooth HFP mics routed through the Windows Sound Mapper often
+        # deliver signals ~60 dB below normal.  Boost to a usable level so
+        # Whisper can transcribe reliably.
+        peak = float(np.max(np.abs(audio)))
+        if peak < self._AGC_MIN_PEAK:
+            print(f"[MIC] Audio peak {peak:.6f} — too quiet, likely silence")
+        elif peak < self._AGC_TARGET_PEAK:
+            gain = self._AGC_TARGET_PEAK / peak
+            audio = np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+            print(f"[MIC] Auto-gain: {20*np.log10(gain):.0f} dB boost "
+                  f"(peak {peak:.6f} → {float(np.max(np.abs(audio))):.3f})")
+
+        return audio
 
     def get_volume(self):
         if not self.audio_data:
             return 0.0
         recent = self.audio_data[-1]
-        return float(np.sqrt(np.mean(recent ** 2)))
+        return float(np.sqrt(np.mean(recent ** 2))) * self._live_gain
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -763,8 +930,8 @@ class WilsonGUI:
     Hardened for resilience, localized, and optimized for performance."""
 
     THEME = {
-        "bg_main": "#000000",         # Pure black — black hole core
-        "bg_panel": "#020402",        # Near-black with faint green tint
+        "bg_main": "#050505",         # Off-black to prevent Windows transparency key bugs
+        "bg_panel": "#0a0c0a",        # Near-black with faint green tint
         "fg_title": "#00ff41",        # Matrix phosphor green
         "fg_text": "#00ff41",         # Matrix green
         "fg_sub": "#00cc33",          # Dimmer Matrix green
@@ -801,15 +968,17 @@ class WilsonGUI:
         self.root.title(self.I18N["title"])
         
         # Transparent Circular Window setup
-        self._transparent_key = "#000001"
+        self._transparent_key = "#ab00cd"
         self.root.geometry("800x800")
         self.root.configure(bg=self._transparent_key)
         
         if IS_WINDOWS:
             self.root.attributes("-transparentcolor", self._transparent_key)
-            self.root.overrideredirect(True) # Remove titlebar
-            # Bind ESC to quit because native close button is gone
+            self.root.overrideredirect(True)
             self.root.bind("<Escape>", lambda e: self.shutdown())
+            # Create a tiny hidden proxy window that lives in the taskbar
+            # and controls minimize/restore of the real frameless window
+            self.root.after(50, self._create_taskbar_proxy)
 
         # Dragging variables
         self._drag_x = 0
@@ -817,6 +986,8 @@ class WilsonGUI:
 
         self.is_listening  = False
         self.is_processing = False
+        self._ready        = False   # True once init thread completes successfully
+        self._auto_listen  = False   # hands-free voice-activated mode
         self.recorder      = None
         self.transcriber   = None
         self.tts           = None
@@ -852,8 +1023,58 @@ class WilsonGUI:
         self._check_queue()
         threading.Thread(target=self._initialize, daemon=True).start()
 
-    # ── window dragging ───────────────────────────────────────────────────────
-    
+    # ── window dragging and taskbar ───────────────────────────────────────────
+
+    def _create_taskbar_proxy(self):
+        """Create a 0×0 hidden Toplevel that keeps Wilson visible in the
+        Windows taskbar. When the user clicks the taskbar icon, we intercept
+        the proxy's state changes to show/hide the real window."""
+        try:
+            import ctypes
+            self._proxy = tk.Toplevel(self.root)
+            self._proxy.title(self.I18N["title"])
+            self._proxy.geometry("0x0+0+0")
+            self._proxy.attributes("-alpha", 0.0)      # fully invisible
+            self._proxy.transient(None)                 # NOT a child — own taskbar entry
+            self.root.wm_attributes("-topmost", False)
+
+            # Make the real (overrideredirect) window owned by the proxy
+            # so the OS groups them, but the proxy is what appears in the taskbar
+            hwnd_main = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            hwnd_proxy = ctypes.windll.user32.GetParent(self._proxy.winfo_id())
+
+            if hwnd_main and hwnd_proxy:
+                # Set proxy as APPWINDOW
+                GWL_EXSTYLE = -20
+                ex = ctypes.windll.user32.GetWindowLongW(hwnd_proxy, GWL_EXSTYLE)
+                ex = ex & ~0x00000080   # ~WS_EX_TOOLWINDOW
+                ex = ex | 0x00040000    # WS_EX_APPWINDOW
+                ctypes.windll.user32.SetWindowLongW(hwnd_proxy, GWL_EXSTYLE, ex)
+                # Owner relationship: clicking taskbar icon controls both
+                ctypes.windll.user32.SetWindowLongW(hwnd_main, -8, hwnd_proxy)  # GWL_HWNDPARENT
+
+            # Intercept minimize / restore on the proxy
+            self._proxy.bind("<Unmap>", self._on_proxy_minimize)
+            self._proxy.bind("<Map>", self._on_proxy_restore)
+            self._proxy.protocol("WM_DELETE_WINDOW", self.shutdown)
+        except Exception as e:
+            print(f"[UI] Taskbar proxy failed: {e}")
+
+    def _on_proxy_minimize(self, event=None):
+        """When the proxy is minimized (taskbar click), hide the real window."""
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            pass
+
+    def _on_proxy_restore(self, event=None):
+        """When the proxy is restored (taskbar click), show the real window."""
+        try:
+            self.root.deiconify()
+            self.root.lift()
+        except tk.TclError:
+            pass
+
     def _start_drag(self, event):
         self._drag_x = event.x
         self._drag_y = event.y
@@ -946,18 +1167,19 @@ class WilsonGUI:
         # ── Matrix Audio Visualizer (replaces boring progress bar) ────────
         self.viz_canvas = tk.Canvas(
             self.main_container, width=340, height=36,
-            bg="#000000", highlightthickness=0,
+            bg=t["bg_main"], highlightthickness=0,
         )
         self.viz_canvas.pack(pady=(4, 6))
         self._draw_viz_idle()
 
-        # Chat log — Matrix terminal (no scrollbar, pure black)
-        cf = tk.Frame(self.main_container, bg="#000000", padx=0, pady=0)
-        cf.pack(padx=10, pady=4, fill=tk.BOTH, expand=True)
+        # Chat log — Matrix terminal — fixed height so the button below stays visible
+        cf = tk.Frame(self.main_container, bg=t["bg_main"], padx=0, pady=0, height=160)
+        cf.pack(padx=10, pady=4, fill=tk.X)
+        cf.pack_propagate(False)  # prevent children from resizing this frame
 
         self.chat = tk.Text(
             cf, font=self._font_mono,
-            bg="#000000", fg=t["fg_text"],
+            bg=t["bg_main"], fg=t["fg_text"],
             wrap=tk.WORD, state=tk.DISABLED,
             relief=tk.FLAT, padx=10, pady=8,
             borderwidth=0, highlightthickness=0,
@@ -970,7 +1192,7 @@ class WilsonGUI:
 
         # Thin Matrix scroll indicator (canvas-drawn, no native scrollbar)
         self.scroll_indicator = tk.Canvas(
-            cf, width=6, bg="#000000", highlightthickness=0,
+            cf, width=6, bg=t["bg_main"], highlightthickness=0,
         )
         self.scroll_indicator.pack(side=tk.RIGHT, fill=tk.Y)
         self.chat.config(yscrollcommand=self._update_scroll_indicator)
@@ -984,20 +1206,38 @@ class WilsonGUI:
         self.chat.tag_configure("system", foreground="#004d1a", font=(FONT_MONO, 9), justify=tk.CENTER)
         self.chat.tag_configure("cursor_blink", foreground="#00ff41", font=(FONT_MONO, 10, "bold"))
 
+        # Button row — side by side
+        btn_row = tk.Frame(self.main_container, bg=t["bg_main"])
+        btn_row.pack(pady=(8, 6))
+
         # Listen button — Matrix style
         self.btn = tk.Button(
-            self.main_container,
+            btn_row,
             text=i18n["btn_ready"],
             font=self._font_btn,
-            bg="#000000", fg=t["accent_ready"],
-            activebackground="#001a00", activeforeground=t["accent_ready_hover"],
-            highlightthickness=1, highlightbackground="#003300",
-            relief=tk.FLAT, width=26, height=1,
+            bg="#0a1a0a", fg=t["accent_ready"],
+            activebackground="#003300", activeforeground=t["accent_ready_hover"],
+            highlightthickness=1, highlightbackground="#00ff41",
+            relief=tk.SOLID, bd=1, width=20, height=2,
             cursor="hand2",
             command=self._toggle_listening,
         )
-        self.btn.pack(pady=(6, 4))
+        self.btn.pack(side=tk.LEFT, padx=(0, 4))
         self.root.bind("<space>", lambda e: self._toggle_listening())
+
+        # Auto-listen toggle button
+        self.auto_btn = tk.Button(
+            btn_row,
+            text="AUTO",
+            font=(FONT_MONO, 10, "bold"),
+            bg="#0a1a0a", fg="#004d1a",
+            activebackground="#001a00", activeforeground="#00ff41",
+            highlightthickness=1, highlightbackground="#003300",
+            relief=tk.SOLID, bd=1, width=6, height=2,
+            cursor="hand2",
+            command=self._toggle_auto_listen,
+        )
+        self.auto_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         # Footer — Matrix terminal info
         _llm_name = "LM Studio" if IS_WINDOWS else "Ollama"
@@ -1030,7 +1270,7 @@ class WilsonGUI:
     def _fade_button_color(self, target_fg, target_bg=None):
         """Matrix-style state transition for button."""
         try:
-            bg = target_bg or "#000000"
+            bg = target_bg or "#0a1a0a"
             self.btn.config(fg=target_fg, bg=bg, activeforeground=target_fg)
         except tk.TclError:
             pass
@@ -1410,11 +1650,19 @@ class WilsonGUI:
             self._log("system", f"TTS: {tts_name}")
 
             self.transcriber = Transcriber()
-            self.transcriber.load(callback=lambda m: self._log("system", m))
+            loaded = self.transcriber.load(callback=lambda m: self._log("system", m))
+            print(f"[DEBUG] Whisper load returned: {loaded}, model is None: {self.transcriber.model is None}")
 
             if IS_JETSON:
                 gc.collect()
 
+            if not loaded or self.transcriber.model is None:
+                self._log("system", "WARNING: Speech recognition failed to load. Check faster-whisper install.")
+                self.root.after(0, lambda: self._set_status("STT FAILED", self.THEME["accent_listen"]))
+                return
+
+            self._ready = True
+            print("[DEBUG] _ready set to True")
             self._log("system", "Wilson is ready. Click the button or press Space.")
             self.root.after(0, lambda: self._set_status(self.I18N["status_ready"], self.THEME["accent_ready"]))
             self.root.after(0, lambda: self._fade_button_color(self.THEME["accent_ready"]))
@@ -1425,11 +1673,95 @@ class WilsonGUI:
 
     # ── listening controls ────────────────────────────────────────────────────
 
+    def _toggle_auto_listen(self):
+        """Toggle hands-free voice-activated mode."""
+        if not self._ready:
+            self._log("system", "Still loading, please wait\u2026")
+            return
+        self._auto_listen = not self._auto_listen
+        t = self.THEME
+        if self._auto_listen:
+            self.auto_btn.config(fg="#00ff41", bg="#002200", highlightbackground="#00ff41")
+            self._log("system", "Auto-listen ON \u2014 speak anytime, Wilson will detect your voice.")
+            self._set_status("AUTO \u2014 LISTENING", t["accent_ready"])
+            threading.Thread(target=self._auto_listen_loop, daemon=True).start()
+        else:
+            self.auto_btn.config(fg="#004d1a", bg="#0a1a0a", highlightbackground="#003300")
+            self._log("system", "Auto-listen OFF")
+            self._set_status(self.I18N["status_ready"], t["accent_ready"])
+
+    def _auto_listen_loop(self):
+        """Background loop: wait for voice activity, record, then process.
+        Runs while _auto_listen is True and we're not already busy."""
+        NOISE_FLOOR = 0.012       # volume threshold to detect speech
+        CONFIRM_SECS = 0.3        # speech must persist this long to trigger
+        CHECK_INTERVAL = 0.05     # polling interval in seconds
+
+        while self._auto_listen:
+            # Wait until not busy
+            if self.is_listening or self.is_processing:
+                time.sleep(0.2)
+                continue
+
+            # Start a monitoring stream to watch for voice activity
+            try:
+                self.recorder.start()
+            except Exception:
+                time.sleep(1)
+                continue
+
+            # Phase 1: Wait for voice onset
+            speech_time = 0.0
+            detected = False
+            while self._auto_listen and not self.is_processing:
+                time.sleep(CHECK_INTERVAL)
+                try:
+                    vol = self.recorder.get_volume()
+                except Exception:
+                    break
+                if vol >= NOISE_FLOOR:
+                    speech_time += CHECK_INTERVAL
+                    if speech_time >= CONFIRM_SECS:
+                        detected = True
+                        break
+                else:
+                    speech_time = 0.0
+
+            if not detected or not self._auto_listen:
+                try:
+                    self.recorder.stop()
+                except Exception:
+                    pass
+                continue
+
+            # Speech detected — switch to full listening mode on the UI thread
+            self.root.after(0, self._auto_start_capture)
+
+            # Phase 2: Wait for processing to finish before looping back
+            while self._auto_listen and (self.is_listening or self.is_processing):
+                time.sleep(0.2)
+
+            # Small cooldown before re-arming so Wilson's own TTS doesn't re-trigger
+            if self._auto_listen:
+                time.sleep(1.0)
+
+    def _auto_start_capture(self):
+        """Called on the UI thread when auto-listen detects voice."""
+        if self.is_processing or self.is_listening:
+            return
+        # The recorder is already running from the detection phase —
+        # just set the UI to listening state and arm the silence watchdog
+        self.is_listening = True
+        self.btn.config(text=self.I18N["btn_listen"])
+        self._fade_button_color(self.THEME["accent_listen"])
+        self._set_status(self.I18N["status_dictate"], self.THEME["accent_listen"])
+        threading.Thread(target=self._silence_watchdog, daemon=True).start()
+
     def _toggle_listening(self):
         if self.is_processing:
             return
-        if self.transcriber is None or self.transcriber.model is None:
-            self._log("system", "Still loading, please wait…")
+        if not self._ready:
+            self._log("system", "Still loading, please wait\u2026")
             return
         if self.is_listening:
             self._stop_listening()
@@ -1521,7 +1853,10 @@ class WilsonGUI:
         try:
             self.btn.config(text=self.I18N["btn_ready"], state=tk.NORMAL)
             self._fade_button_color(self.THEME["accent_ready"])
-            self._set_status(self.I18N["status_ready"], self.THEME["accent_ready"])
+            if self._auto_listen:
+                self._set_status("AUTO \u2014 LISTENING", self.THEME["accent_ready"])
+            else:
+                self._set_status(self.I18N["status_ready"], self.THEME["accent_ready"])
         except tk.TclError:
             pass
 
@@ -1529,6 +1864,7 @@ class WilsonGUI:
 
     def shutdown(self):
         self.is_listening = False
+        self._auto_listen = False
         try:
             self.monitor.stop()
         except Exception:
@@ -1539,6 +1875,11 @@ class WilsonGUI:
                 self.recorder.stream.close()
             except Exception:
                 pass
+        try:
+            if hasattr(self, "_proxy"):
+                self._proxy.destroy()
+        except Exception:
+            pass
         try:
             self.root.destroy()
         except Exception:
