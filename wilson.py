@@ -5,7 +5,7 @@ Supports : Windows, macOS (Intel & Apple Silicon), Linux, NVIDIA Jetson
 GPU      : NVIDIA CUDA auto-detected — falls back to CPU if unavailable
 Pipeline : Mic → faster-whisper (STT) → LLM (embedded llama.cpp) → Piper TTS → Speaker
 Standalone : Packable as a single .exe — no LM Studio / Ollama required.
-NanoSAM  : Optional real-time image segmentation when model files are present.
+SAM      : Optional EfficientViT-SAM image segmentation when model files are present.
 
 Environment-variable overrides (all optional):
   WILSON_EMBEDDED_LLM       "1" (default) embedded LLM, "0" for remote API
@@ -42,7 +42,22 @@ import re
 import random
 import shutil
 import math
+import json as _json
 import numpy as np
+
+# ── Pre-load CUDA DLLs on Windows ─────────────────────────────────────────────
+# pip-installed nvidia packages bury DLLs in site-packages/nvidia/*/bin/
+# which aren't on PATH.  Register them so CTranslate2 / Whisper find them.
+if sys.platform == "win32":
+    try:
+        import importlib.util
+        _nv_base = os.path.join(os.path.dirname(importlib.util.find_spec("nvidia").submodule_search_locations[0]), "nvidia")
+        for _pkg in ("cublas", "cudnn", "cuda_runtime", "cufft", "curand", "cusolver", "cusparse", "nccl"):
+            _dll_dir = os.path.join(_nv_base, _pkg, "bin")
+            if os.path.isdir(_dll_dir):
+                os.add_dll_directory(_dll_dir)
+    except Exception:
+        pass
 
 # sounddevice is lazy-loaded because PortAudio can hang during device
 # enumeration on some Windows/AMD audio configurations at import time.
@@ -161,7 +176,7 @@ PIPER_VOICE = os.path.join(WILSON_DIR, "en_US-amy-medium.onnx")
 # ── Embedded LLM (default — no server needed) ────────────────────────────────
 #  Uses llama-cpp-python to load a GGUF model directly.
 #  Model auto-downloads from HuggingFace on first run (~1 GB).
-#  Chosen to be lightweight so it can coexist with NanoSAM on one GPU.
+#  Chosen to be lightweight so it can coexist with EfficientViT-SAM on one GPU.
 USE_EMBEDDED_LLM = os.environ.get("WILSON_EMBEDDED_LLM", "1") == "1"
 MODELS_DIR       = os.path.join(WILSON_DIR, "models")
 
@@ -680,11 +695,12 @@ class Transcriber:
             segments, _ = self.model.transcribe(
                 audio,
                 language="en",
-                beam_size=3 if IS_JETSON else 5,
+                beam_size=1,
+                best_of=1,
                 vad_filter=True,
                 vad_parameters=dict(
                     min_silence_duration_ms=300,
-                    speech_pad_ms=200,
+                    speech_pad_ms=150,
                 ),
             )
             text = " ".join(s.text for s in segments).strip()
@@ -956,7 +972,7 @@ class LLMClient:
       Remote  (fallback) — OpenAI-compatible HTTP API.
 
     The embedded model is chosen to be small enough (~1 GB) to coexist
-    with NanoSAM on a single GPU.
+    with EfficientViT-SAM on a single GPU.
     """
 
     def __init__(self, embedded=None):
@@ -1012,8 +1028,10 @@ class LLMClient:
             log(f"Loading {EMBEDDED_MODEL_FILE} …")
             self._model = Llama(
                 model_path=model_path,
-                n_ctx=4096,
+                n_ctx=2048,
+                n_batch=512,
                 n_gpu_layers=n_gpu,
+                flash_attn=CUDA_AVAILABLE,
                 verbose=False,
             )
             gpu_str = f"GPU, {n_gpu} layers" if n_gpu else "CPU only"
@@ -1099,29 +1117,48 @@ class LLMClient:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#                          NANOSAM INTEGRATION
+#                      EFFICIENTVIT-SAM INTEGRATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class NanoSAMEngine:
+class EfficientViTSAMEngine:
     """
-    Optional NanoSAM (Segment Anything — NVIDIA distilled) integration.
+    Optional EfficientViT-SAM (MIT Han Lab) integration.
+
+    EfficientViT-SAM is a hardware-efficient variant of Segment Anything
+    that achieves real-time inference with ONNX Runtime.
 
     Provides real-time image segmentation when the ONNX model files are
     present in the models/ directory.  Wilson can use this to "see" and
     describe objects through a connected camera.
 
     Required files in models/:
-      nanosam_image_encoder.onnx   — image encoder (~6 MB)
-      nanosam_mask_decoder.onnx    — mask decoder  (~4 MB)
+      efficientvit_sam_encoder.onnx   — image encoder
+      efficientvit_sam_decoder.onnx   — mask decoder
+
+    Recommended models (place in models/ directory):
+      - efficientvit_sam_l0  (~30 MB)  — fastest, lightweight
+      - efficientvit_sam_l1  (~45 MB)  — balanced speed / quality
+      - efficientvit_sam_l2  (~65 MB)  — higher quality
+      - efficientvit_sam_xl0 (~120 MB) — best quality
+      - efficientvit_sam_xl1 (~180 MB) — maximum quality
+
+    Get models from: https://github.com/mit-han-lab/efficientvit
 
     Install:
       pip install onnxruntime-gpu opencv-python
 
-    NanoSAM is entirely optional.  Wilson works fine without it.
+    EfficientViT-SAM is entirely optional.  Wilson works fine without it.
     """
 
-    ENCODER_FILE = "nanosam_image_encoder.onnx"
-    DECODER_FILE = "nanosam_mask_decoder.onnx"
+    ENCODER_FILE = "efficientvit_sam_encoder.onnx"
+    DECODER_FILE = "efficientvit_sam_decoder.onnx"
+
+    # EfficientViT-SAM encoder expects 1024×1024 input (same as SAM)
+    INPUT_SIZE = 1024
+
+    # ImageNet normalisation constants
+    _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
+    _STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
 
     def __init__(self):
         self.available     = False
@@ -1132,7 +1169,7 @@ class NanoSAMEngine:
         self._try_load()
 
     def _try_load(self):
-        """Attempt to load NanoSAM models.  Silent no-op if unavailable."""
+        """Attempt to load EfficientViT-SAM models.  Silent no-op if unavailable."""
         enc_path = os.path.join(MODELS_DIR, self.ENCODER_FILE)
         dec_path = os.path.join(MODELS_DIR, self.DECODER_FILE)
 
@@ -1147,11 +1184,11 @@ class NanoSAMEngine:
             self._encoder = ort.InferenceSession(enc_path, providers=providers)
             self._decoder = ort.InferenceSession(dec_path, providers=providers)
             self.available = True
-            print("[NANOSAM] Image encoder + mask decoder loaded")
+            print("[SAM] EfficientViT-SAM encoder + decoder loaded")
         except ImportError:
-            print("[NANOSAM] onnxruntime not installed — pip install onnxruntime-gpu")
+            print("[SAM] onnxruntime not installed — pip install onnxruntime-gpu")
         except Exception as e:
-            print(f"[NANOSAM] Load failed: {e}")
+            print(f"[SAM] Load failed: {e}")
 
     # ── camera ────────────────────────────────────────────────────────────
 
@@ -1165,13 +1202,13 @@ class NanoSAMEngine:
                 self._camera = cv2.VideoCapture(device_id)
                 ok = self._camera.isOpened()
                 if ok:
-                    print(f"[NANOSAM] Camera {device_id} opened")
+                    print(f"[SAM] Camera {device_id} opened")
                 return ok
         except ImportError:
-            print("[NANOSAM] opencv-python not installed")
+            print("[SAM] opencv-python not installed")
             return False
         except Exception as e:
-            print(f"[NANOSAM] Camera error: {e}")
+            print(f"[SAM] Camera error: {e}")
             return False
 
     def capture_frame(self):
@@ -1188,64 +1225,113 @@ class NanoSAMEngine:
                 self._camera.release()
                 self._camera = None
 
+    # ── pre-processing ────────────────────────────────────────────────────
+
+    def _preprocess(self, image_bgr):
+        """Resize, normalise (ImageNet stats), return NCHW float32 + scale info."""
+        import cv2
+        h, w = image_bgr.shape[:2]
+        # Resize longest side to INPUT_SIZE, pad to square
+        scale = self.INPUT_SIZE / max(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        resized = cv2.resize(image_bgr, (new_w, new_h))
+        # Pad to INPUT_SIZE × INPUT_SIZE
+        padded = np.zeros((self.INPUT_SIZE, self.INPUT_SIZE, 3), dtype=np.uint8)
+        padded[:new_h, :new_w] = resized
+        # BGR → RGB, HWC → CHW, normalise
+        rgb = padded[:, :, ::-1].astype(np.float32) / 255.0
+        chw = np.transpose(rgb, (2, 0, 1))[np.newaxis]     # 1×3×1024×1024
+        chw = (chw - self._MEAN) / self._STD
+        return chw.astype(np.float32), (h, w, new_h, new_w, scale)
+
     # ── inference ─────────────────────────────────────────────────────────
 
     def encode_image(self, image_bgr):
-        """Run the image encoder.  Returns the image embedding tensor."""
+        """Run the image encoder.  Returns (embedding, size_info) or (None, None)."""
         if not self.available or self._encoder is None:
-            return None
+            return None, None
         try:
-            import cv2
-            # NanoSAM expects 3×1024×1024 float32 normalised
-            img = cv2.resize(image_bgr, (1024, 1024))
-            img = img.astype(np.float32) / 255.0
-            img = np.transpose(img, (2, 0, 1))[np.newaxis]      # NCHW
+            tensor, size_info = self._preprocess(image_bgr)
             inp_name = self._encoder.get_inputs()[0].name
-            return self._encoder.run(None, {inp_name: img})[0]
+            embedding = self._encoder.run(None, {inp_name: tensor})[0]
+            return embedding, size_info
         except Exception as e:
-            print(f"[NANOSAM] Encode error: {e}")
-            return None
+            print(f"[SAM] Encode error: {e}")
+            return None, None
 
-    def segment(self, image_embedding, point=None, box=None):
+    def segment(self, image_embedding, size_info=None, point=None, box=None):
         """Run the mask decoder.  Returns binary mask (H×W bool array) or None.
 
         Args:
             image_embedding: output of encode_image()
-            point: (x, y) normalised [0-1] click coordinate
-            box:   (x1, y1, x2, y2) normalised bounding box
+            size_info:       (orig_h, orig_w, new_h, new_w, scale) from encode_image
+            point: (x, y) pixel coordinates in the original image
+            box:   (x1, y1, x2, y2) pixel coordinates bounding box
         """
         if not self.available or self._decoder is None or image_embedding is None:
             return None
         try:
-            # Build prompt tensors (simplified — real NanoSAM has more inputs)
+            import cv2
+            scale = size_info[4] if size_info else 1.0
+
+            # Build prompt coordinates in resized image space
             if point is not None:
-                coords = np.array([[point]], dtype=np.float32)  # 1×1×2
-                labels = np.array([[1]], dtype=np.float32)      # foreground
+                px, py = float(point[0]) * scale, float(point[1]) * scale
+                coords = np.array([[[px, py]]], dtype=np.float32)       # 1×1×2
+                labels = np.array([[1]], dtype=np.float32)              # foreground
             elif box is not None:
-                coords = np.array([[[box[0], box[1]], [box[2], box[3]]]], dtype=np.float32)
+                x1, y1 = float(box[0]) * scale, float(box[1]) * scale
+                x2, y2 = float(box[2]) * scale, float(box[3]) * scale
+                coords = np.array([[[x1, y1], [x2, y2]]], dtype=np.float32)  # 1×2×2
                 labels = np.array([[2, 3]], dtype=np.float32)
             else:
-                # Centre-point default
-                coords = np.array([[[0.5, 0.5]]], dtype=np.float32)
+                # Default: centre of the image
+                cx = self.INPUT_SIZE / 2.0
+                cy = self.INPUT_SIZE / 2.0
+                coords = np.array([[[cx, cy]]], dtype=np.float32)
                 labels = np.array([[1]], dtype=np.float32)
 
+            # Map inputs by name
             inputs = {}
             for inp in self._decoder.get_inputs():
-                name = inp.name.lower()
-                if "image" in name or "embed" in name:
+                name_lower = inp.name.lower()
+                if "image" in name_lower or "embed" in name_lower:
                     inputs[inp.name] = image_embedding
-                elif "coord" in name or "point" in name:
+                elif "coord" in name_lower or "point" in name_lower:
                     inputs[inp.name] = coords
-                elif "label" in name:
+                elif "label" in name_lower:
                     inputs[inp.name] = labels
+                elif "mask" in name_lower and "input" in name_lower:
+                    # Some decoders expect a mask input (zeros)
+                    inputs[inp.name] = np.zeros((1, 1, 256, 256), dtype=np.float32)
+                elif "has_mask" in name_lower or "has" in name_lower:
+                    inputs[inp.name] = np.array([0], dtype=np.float32)
+                elif "orig" in name_lower or "size" in name_lower:
+                    orig_h = size_info[0] if size_info else self.INPUT_SIZE
+                    orig_w = size_info[1] if size_info else self.INPUT_SIZE
+                    inputs[inp.name] = np.array([orig_h, orig_w], dtype=np.float32)
 
             masks = self._decoder.run(None, inputs)
             if masks and len(masks) > 0:
-                mask = masks[0][0, 0] > 0.0    # first mask, threshold
-                return mask
+                mask = masks[0]
+                # Handle different output shapes
+                if mask.ndim == 4:
+                    mask = mask[0, 0]
+                elif mask.ndim == 3:
+                    mask = mask[0]
+                binary = mask > 0.0
+
+                # Resize mask back to original image dimensions if size_info given
+                if size_info is not None:
+                    orig_h, orig_w = size_info[0], size_info[1]
+                    binary_u8 = binary.astype(np.uint8) * 255
+                    binary_u8 = cv2.resize(binary_u8, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+                    binary = binary_u8 > 127
+
+                return binary
             return None
         except Exception as e:
-            print(f"[NANOSAM] Segment error: {e}")
+            print(f"[SAM] Segment error: {e}")
             return None
 
     @property
@@ -1257,6 +1343,199 @@ class NanoSAMEngine:
         if not enc or not dec:
             return "model files missing"
         return "load failed"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                        FACE RECOGNITION ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FaceRecognitionEngine:
+    """
+    Real-time face detection and recognition using OpenCV.
+
+    Detection  : Haar cascade (ships with opencv-python — no extra files).
+    Recognition: Spatial histogram descriptors (5×5 grid, 32 bins per cell).
+                 Compared via histogram correlation.  No deep learning deps.
+
+    Stores known face descriptors + names in faces/face_db.json.
+    Face images are *not* saved — only compact numerical descriptors.
+    """
+
+    FACES_DIR   = os.path.join(WILSON_DIR, "faces")
+    DB_FILE     = os.path.join(WILSON_DIR, "faces", "face_db.json")
+    FACE_SIZE   = (100, 100)
+    GRID        = 5
+    BINS        = 32
+    DESCRIPTOR_LEN = GRID * GRID * BINS          # 800 floats
+    MATCH_THRESHOLD = 0.55                        # histogram correlation ≥ this → match
+    ENROLL_SAMPLES  = 20                          # frames captured during enrollment
+
+    def __init__(self):
+        self.available    = False
+        self._cascade     = None
+        self._camera      = None
+        self._camera_lock = threading.Lock()
+        self._known_faces = {}          # {name: [descriptor, …]}
+        self._init()
+
+    # ── bootstrap ─────────────────────────────────────────────────────────
+
+    def _init(self):
+        try:
+            import cv2
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            self._cascade = cv2.CascadeClassifier(cascade_path)
+            if self._cascade.empty():
+                print("[FACE] Haar cascade failed to load")
+                return
+            os.makedirs(self.FACES_DIR, exist_ok=True)
+            self._load_db()
+            self.available = True
+            print(f"[FACE] Ready — {len(self._known_faces)} known person(s)")
+        except ImportError:
+            print("[FACE] opencv-python not installed")
+        except Exception as e:
+            print(f"[FACE] Init error: {e}")
+
+    # ── persistence ───────────────────────────────────────────────────────
+
+    def _load_db(self):
+        self._known_faces = {}
+        if not os.path.isfile(self.DB_FILE):
+            return
+        try:
+            with open(self.DB_FILE, "r") as f:
+                db = _json.load(f)
+            for name, descriptors in db.items():
+                self._known_faces[name] = [
+                    np.array(d, dtype=np.float32) for d in descriptors
+                ]
+        except Exception as e:
+            print(f"[FACE] DB load error: {e}")
+
+    def _save_db(self):
+        db = {}
+        for name, descriptors in self._known_faces.items():
+            db[name] = [d.tolist() for d in descriptors]
+        try:
+            with open(self.DB_FILE, "w") as f:
+                _json.dump(db, f)
+        except Exception as e:
+            print(f"[FACE] DB save error: {e}")
+
+    # ── descriptor ────────────────────────────────────────────────────────
+
+    def _face_descriptor(self, face_gray):
+        """Return a spatial-histogram descriptor (800-dim) for a grayscale face."""
+        import cv2
+        face = cv2.resize(face_gray, self.FACE_SIZE)
+        cell_h = self.FACE_SIZE[1] // self.GRID
+        cell_w = self.FACE_SIZE[0] // self.GRID
+        parts = []
+        for r in range(self.GRID):
+            for c in range(self.GRID):
+                cell = face[r * cell_h:(r + 1) * cell_h,
+                            c * cell_w:(c + 1) * cell_w]
+                hist = cv2.calcHist([cell], [0], None, [self.BINS], [0, 256])
+                cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+                parts.append(hist.flatten())
+        return np.concatenate(parts).astype(np.float32)
+
+    # ── camera ────────────────────────────────────────────────────────────
+
+    def open_camera(self, device_id=0):
+        import cv2
+        with self._camera_lock:
+            if self._camera is not None:
+                self._camera.release()
+            self._camera = cv2.VideoCapture(device_id)
+            ok = self._camera.isOpened()
+            if ok:
+                # Lower resolution for speed
+                self._camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                self._camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                print(f"[FACE] Camera {device_id} opened")
+            return ok
+
+    def close_camera(self):
+        with self._camera_lock:
+            if self._camera is not None:
+                self._camera.release()
+                self._camera = None
+
+    def capture_frame(self):
+        with self._camera_lock:
+            if self._camera is None or not self._camera.isOpened():
+                return None
+            ret, frame = self._camera.read()
+            return frame if ret else None
+
+    # ── detection + recognition ───────────────────────────────────────────
+
+    def detect_faces(self, frame):
+        """Detect faces in a BGR frame.
+        Returns (rects, gray) where rects is a list of (x, y, w, h)."""
+        import cv2
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        rects = self._cascade.detectMultiScale(
+            gray, scaleFactor=1.3, minNeighbors=5, minSize=(60, 60),
+        )
+        # Convert ndarray to list of tuples
+        if len(rects) == 0:
+            return [], gray
+        return [tuple(r) for r in rects], gray
+
+    def recognize(self, gray, x, y, w, h):
+        """Match a face region against known faces.
+        Returns (name, confidence) or (None, 0.0)."""
+        import cv2
+        face_crop = gray[y:y + h, x:x + w]
+        desc = self._face_descriptor(face_crop)
+
+        best_name = None
+        best_score = 0.0
+
+        for name, descriptors in self._known_faces.items():
+            scores = []
+            for stored in descriptors:
+                score = cv2.compareHist(
+                    desc.reshape(-1, 1),
+                    stored.reshape(-1, 1),
+                    cv2.HISTCMP_CORREL,
+                )
+                scores.append(score)
+            # Average top-5 scores for robustness
+            top = sorted(scores, reverse=True)[:5]
+            avg = float(np.mean(top)) if top else 0.0
+            if avg > best_score:
+                best_score = avg
+                best_name = name
+
+        if best_score >= self.MATCH_THRESHOLD:
+            return best_name, best_score
+        return None, best_score
+
+    def add_sample(self, name, gray, x, y, w, h):
+        """Add one face descriptor sample for a person."""
+        face_crop = gray[y:y + h, x:x + w]
+        desc = self._face_descriptor(face_crop)
+        if name not in self._known_faces:
+            self._known_faces[name] = []
+        self._known_faces[name].append(desc)
+
+    def save(self):
+        """Persist the current face database to disk."""
+        self._save_db()
+
+    def remove_person(self, name):
+        if name in self._known_faces:
+            del self._known_faces[name]
+            self._save_db()
+
+    @property
+    def known_names(self):
+        return list(self._known_faces.keys())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1331,9 +1610,22 @@ class WilsonGUI:
         self.transcriber   = None
         self.tts           = None
         self.llm           = LLMClient()
-        self.nanosam       = NanoSAMEngine()
+        self.sam           = EfficientViTSAMEngine()
+        self.face_engine   = FaceRecognitionEngine()
         self.monitor       = JetsonMonitor()
         self.msg_queue     = queue.Queue()
+
+        # Camera / face recognition state
+        self._camera_active       = False
+        self._enrolling_name      = None     # set during face enrollment
+        self._enroll_count        = 0
+        self._last_greeted        = None     # avoid repeated greetings
+        self._unknown_streak      = 0        # consecutive unknown detections
+        self._enroll_dialog_open  = False    # prevent duplicate enroll dialogs
+        self._enroll_cooldown     = 0.0      # time.time() when cooldown expires
+
+        # Face management panel state
+        self._faces_panel_open    = False
 
         # Matrix text animation state
         self._matrix_busy = False
@@ -1463,11 +1755,12 @@ class WilsonGUI:
             fg=t["fg_title"], bg=t["bg_main"],
         ).pack(pady=(0, 3))
 
-        tk.Label(
+        self._subtitle_label = tk.Label(
             self.main_container, text=subtitle,
             font=self._font_sub,
             fg=t["fg_sub"], bg=t["bg_main"],
-        ).pack()
+        )
+        self._subtitle_label.pack()
 
         # ── Animated Face (eyes + mouth) ──────────────────────────────────
         self.face_canvas = tk.Canvas(
@@ -1611,9 +1904,37 @@ class WilsonGUI:
         )
         self.auto_btn.pack(side=tk.LEFT, padx=(4, 0))
 
+        # Camera / face recognition toggle button
+        self.cam_btn = tk.Button(
+            btn_row,
+            text="CAM",
+            font=(FONT_MONO, 10, "bold"),
+            bg="#0a1a0a", fg="#004d1a",
+            activebackground="#001a00", activeforeground="#00ff41",
+            highlightthickness=1, highlightbackground="#003300",
+            relief=tk.SOLID, bd=1, width=6, height=2,
+            cursor="hand2",
+            command=self._toggle_camera,
+        )
+        self.cam_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        # Face management button
+        self.faces_btn = tk.Button(
+            btn_row,
+            text="FACES",
+            font=(FONT_MONO, 9, "bold"),
+            bg="#0a1a0a", fg="#004d1a",
+            activebackground="#001a00", activeforeground="#00ff41",
+            highlightthickness=1, highlightbackground="#003300",
+            relief=tk.SOLID, bd=1, width=6, height=2,
+            cursor="hand2",
+            command=self._toggle_faces_panel,
+        )
+        self.faces_btn.pack(side=tk.LEFT, padx=(4, 0))
+
         # Footer — Matrix terminal info
         _llm_name = "Embedded" if USE_EMBEDDED_LLM else ("LM Studio" if IS_WINDOWS else "Ollama")
-        _sam_tag  = " | SAM:ready" if os.path.isfile(os.path.join(MODELS_DIR, NanoSAMEngine.ENCODER_FILE)) else ""
+        _sam_tag  = " | SAM:ready" if os.path.isfile(os.path.join(MODELS_DIR, EfficientViTSAMEngine.ENCODER_FILE)) else ""
         cfg = (
             f"STT:{WHISPER_MODEL}({WHISPER_DEVICE}) | "
             f"LLM:{_llm_name}{_sam_tag}"
@@ -2026,8 +2347,8 @@ class WilsonGUI:
             self.llm.load(callback=lambda m: self._log("system", m))
             self._log("system", f"LLM mode: {self.llm.mode}")
 
-            if self.nanosam.available:
-                self._log("system", "NanoSAM: ready")
+            if self.sam.available:
+                self._log("system", "EfficientViT-SAM: ready")
 
             self.transcriber = Transcriber()
             loaded = self.transcriber.load(callback=lambda m: self._log("system", m))
@@ -2188,6 +2509,309 @@ class WilsonGUI:
             except Exception:
                 break
 
+    # ── camera / face recognition ─────────────────────────────────────────────
+
+    def _toggle_camera(self):
+        """Toggle the camera feed for face recognition (inline in main window)."""
+        if self._camera_active:
+            self._close_camera()
+        else:
+            # Close faces panel if open (they share the same area)
+            if self._faces_panel_open:
+                self._close_faces_panel()
+            self._open_camera()
+
+    def _open_camera(self):
+        if not self.face_engine.available:
+            self._log("system", "Face recognition unavailable (opencv not installed)")
+            return
+        if not self.face_engine.open_camera():
+            self._log("system", "Could not open camera")
+            return
+
+        self._camera_active = True
+        self._last_greeted = None
+        self._unknown_streak = 0
+        self._enroll_dialog_open = False
+        self.cam_btn.config(fg="#00ff41", bg="#002200", highlightbackground="#00ff41")
+
+        # Hide the animated face canvas; show camera canvas in its place
+        t = self.THEME
+        self.face_canvas.pack_forget()
+
+        # Camera container (replaces face_canvas slot)
+        self._cam_frame = tk.Frame(self.main_container, bg=t["bg_main"])
+        # Insert camera frame where face_canvas was (before status row)
+        # Pack it right after the subtitle — find the right spot
+        self._cam_frame.pack(after=self._subtitle_label, pady=(4, 2))
+
+        self._cam_canvas = tk.Canvas(
+            self._cam_frame, width=200, height=150,
+            bg="#000000", highlightthickness=1, highlightbackground="#003300",
+        )
+        self._cam_canvas.pack()
+
+        self._cam_label = tk.Label(
+            self._cam_frame, text="Scanning…",
+            font=(FONT_MONO, 8), fg="#00ff41", bg=t["bg_main"],
+        )
+        self._cam_label.pack()
+
+        self._cam_photo = None  # prevent GC
+        self._camera_tick()
+
+    def _close_camera(self):
+        self._camera_active = False
+        self.face_engine.close_camera()
+        self.cam_btn.config(fg="#004d1a", bg="#0a1a0a", highlightbackground="#003300")
+
+        # Remove camera frame, restore animated face canvas
+        try:
+            if hasattr(self, '_cam_frame') and self._cam_frame is not None:
+                self._cam_frame.destroy()
+                self._cam_frame = None
+        except tk.TclError:
+            pass
+
+        # Re-show the animated face canvas where it was
+        try:
+            self.face_canvas.pack(after=self._subtitle_label, pady=(8, 2))
+            self._draw_face()
+        except tk.TclError:
+            pass
+
+    def _camera_tick(self):
+        """Grab a frame, detect/recognise faces, update preview.  ~15 FPS."""
+        if not self._camera_active:
+            return
+        frame = self.face_engine.capture_frame()
+        if frame is None:
+            try:
+                self.root.after(66, self._camera_tick)
+            except tk.TclError:
+                pass
+            return
+
+        import cv2
+
+        rects, gray = self.face_engine.detect_faces(frame)
+
+        # ── Enrollment mode: collecting samples ──
+        if self._enrolling_name is not None:
+            for (x, y, w, h) in rects:
+                self.face_engine.add_sample(self._enrolling_name, gray, x, y, w, h)
+                self._enroll_count += 1
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                cv2.putText(frame, f"Enrolling… {self._enroll_count}/{self.face_engine.ENROLL_SAMPLES}",
+                            (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+            if self._enroll_count >= self.face_engine.ENROLL_SAMPLES:
+                self.face_engine.save()
+                name = self._enrolling_name
+                self._enrolling_name = None
+                self._enroll_count = 0
+                self._log("system", f"Enrolled '{name}' ({len(self.face_engine._known_faces.get(name, []))} samples)")
+                self._last_greeted = name
+                # Greet the newly enrolled person
+                threading.Thread(target=self._greet_person, args=(name, True), daemon=True).start()
+
+        else:
+            # ── Normal recognition mode ──
+            for (x, y, w, h) in rects:
+                name, conf = self.face_engine.recognize(gray, x, y, w, h)
+                if name is not None:
+                    color = (0, 255, 65)   # green
+                    label = f"{name} ({conf:.0%})"
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(frame, label, (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    self._unknown_streak = 0
+                    if name != self._last_greeted:
+                        self._last_greeted = name
+                        threading.Thread(target=self._greet_person, args=(name, False), daemon=True).start()
+                else:
+                    color = (0, 0, 255)    # red
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(frame, "Unknown", (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    self._unknown_streak += 1
+                    # After 30 consecutive unknown frames (~2 sec), prompt to enroll
+                    if self._unknown_streak >= 30 and not self._enroll_dialog_open and time.time() >= self._enroll_cooldown:
+                        self._unknown_streak = 0
+                        self.root.after(0, self._prompt_enroll)
+
+        # ── Render frame to tkinter canvas (PPM method — no PIL needed) ──
+        try:
+            preview = cv2.resize(frame, (200, 150))
+            rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+            ppm = f"P6\n200 150\n255\n".encode() + rgb.tobytes()
+            self._cam_photo = tk.PhotoImage(data=ppm, format="PPM")
+            self._cam_canvas.create_image(0, 0, anchor=tk.NW, image=self._cam_photo)
+        except Exception:
+            pass
+
+        # Update status label
+        try:
+            if self._enrolling_name:
+                self._cam_label.config(text=f"Enrolling: {self._enrolling_name}")
+            elif rects:
+                self._cam_label.config(text=f"Face{'s' if len(rects) > 1 else ''} detected: {len(rects)}")
+            else:
+                self._cam_label.config(text="Scanning…")
+        except tk.TclError:
+            pass
+
+        try:
+            self.root.after(66, self._camera_tick)   # ~15 FPS
+        except tk.TclError:
+            pass
+
+    def _prompt_enroll(self):
+        """Show a dialog asking the user to name an unknown face."""
+        # Guard: skip if already enrolling, dialog already open, or cooldown active
+        if self._enrolling_name is not None:
+            return
+        if self._enroll_dialog_open:
+            return
+        if time.time() < self._enroll_cooldown:
+            return
+
+        self._enroll_dialog_open = True
+        try:
+            from tkinter import simpledialog
+            name = simpledialog.askstring(
+                "New Face Detected",
+                "Enter the person's name (or Cancel to skip):",
+                parent=self.root,
+            )
+            if name and name.strip():
+                name = name.strip()
+                self._enrolling_name = name
+                self._enroll_count = 0
+                self._log("system", f"Look at the camera — enrolling '{name}'…")
+            else:
+                # User cancelled — enforce 10-second cooldown before asking again
+                self._enroll_cooldown = time.time() + 10.0
+        except Exception:
+            pass
+        finally:
+            self._enroll_dialog_open = False
+
+    def _greet_person(self, name, is_new):
+        """Wilson greets a recognised (or newly enrolled) person via TTS."""
+        if is_new:
+            greeting = f"Nice to meet you, {name}! I'll remember your face."
+        else:
+            greeting = f"Hello, {name}!"
+        self._log("wilson", greeting)
+        if self.tts:
+            self.tts.speak(greeting, log_fn=lambda m: self._log("system", m))
+
+    # ── face management panel ─────────────────────────────────────────────────
+
+    def _toggle_faces_panel(self):
+        """Toggle an inline face-management panel (replaces face canvas area)."""
+        if self._faces_panel_open:
+            self._close_faces_panel()
+        else:
+            self._open_faces_panel()
+
+    def _open_faces_panel(self):
+        """Show a panel listing all known faces with delete buttons, inline."""
+        # Close camera first if active (they share the same display area)
+        if self._camera_active:
+            self._close_camera()
+
+        self._faces_panel_open = True
+        self.faces_btn.config(fg="#00ff41", bg="#002200", highlightbackground="#00ff41")
+
+        t = self.THEME
+        self.face_canvas.pack_forget()
+
+        self._faces_frame = tk.Frame(self.main_container, bg=t["bg_main"])
+        self._faces_frame.pack(after=self._subtitle_label, pady=(4, 2))
+
+        tk.Label(
+            self._faces_frame, text="[ FACE MANAGEMENT ]",
+            font=(FONT_MONO, 10, "bold"), fg="#00ff41", bg=t["bg_main"],
+        ).pack(pady=(2, 4))
+
+        names = self.face_engine.known_names
+        if not names:
+            tk.Label(
+                self._faces_frame, text="No faces enrolled yet.",
+                font=(FONT_MONO, 9), fg="#004d1a", bg=t["bg_main"],
+            ).pack(pady=4)
+        else:
+            # Scrollable list frame (max height ~100px)
+            list_frame = tk.Frame(self._faces_frame, bg=t["bg_main"])
+            list_frame.pack(fill=tk.X, padx=10)
+
+            for name in sorted(names):
+                row = tk.Frame(list_frame, bg=t["bg_main"])
+                row.pack(fill=tk.X, pady=1)
+
+                samples = len(self.face_engine._known_faces.get(name, []))
+                tk.Label(
+                    row, text=f"  {name} ({samples} samples)",
+                    font=(FONT_MONO, 9), fg="#00cc33", bg=t["bg_main"],
+                    anchor="w",
+                ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+                del_btn = tk.Button(
+                    row, text="DEL",
+                    font=(FONT_MONO, 8, "bold"),
+                    bg="#1a0000", fg="#ff0040",
+                    activebackground="#330000", activeforeground="#ff3366",
+                    highlightthickness=0, relief=tk.FLAT, bd=0,
+                    cursor="hand2", width=4,
+                    command=lambda n=name: self._delete_face(n),
+                )
+                del_btn.pack(side=tk.RIGHT, padx=2)
+
+        # Add "Enroll New" button at the bottom
+        enroll_btn = tk.Button(
+            self._faces_frame, text="+ ENROLL NEW",
+            font=(FONT_MONO, 9, "bold"),
+            bg="#001a00", fg="#00ff41",
+            activebackground="#003300", activeforeground="#33ff66",
+            highlightthickness=1, highlightbackground="#003300",
+            relief=tk.SOLID, bd=1, cursor="hand2",
+            command=self._enroll_from_panel,
+        )
+        enroll_btn.pack(pady=(6, 2))
+
+    def _close_faces_panel(self):
+        """Close inline faces panel and restore animated face canvas."""
+        self._faces_panel_open = False
+        self.faces_btn.config(fg="#004d1a", bg="#0a1a0a", highlightbackground="#003300")
+        try:
+            if hasattr(self, '_faces_frame') and self._faces_frame is not None:
+                self._faces_frame.destroy()
+                self._faces_frame = None
+        except tk.TclError:
+            pass
+        try:
+            self.face_canvas.pack(after=self._subtitle_label, pady=(8, 2))
+            self._draw_face()
+        except tk.TclError:
+            pass
+
+    def _delete_face(self, name):
+        """Delete a known face and refresh the panel."""
+        self.face_engine.remove_person(name)
+        self._log("system", f"Removed '{name}' from face database")
+        # Refresh the panel
+        self._close_faces_panel()
+        self._open_faces_panel()
+
+    def _enroll_from_panel(self):
+        """Open the camera and start enrollment from the management panel."""
+        self._close_faces_panel()
+        # Open camera — it will handle enrollment once a face is detected as unknown
+        self._open_camera()
+        self._log("system", "Camera opened for enrollment. Show your face…")
+
     # ── text chat ─────────────────────────────────────────────────────────────
 
     def _send_text(self):
@@ -2291,6 +2915,11 @@ class WilsonGUI:
     def shutdown(self):
         self.is_listening = False
         self._auto_listen = False
+        self._camera_active = False
+        try:
+            self.face_engine.close_camera()
+        except Exception:
+            pass
         try:
             self.monitor.stop()
         except Exception:
@@ -2532,10 +3161,10 @@ def run_diagnostics():
         except Exception:
             check("API reachable", False, f"{LLM_URL} — is the server running?")
 
-    # NanoSAM
-    print("\n  NanoSAM (optional):")
-    enc_path = os.path.join(MODELS_DIR, NanoSAMEngine.ENCODER_FILE)
-    dec_path = os.path.join(MODELS_DIR, NanoSAMEngine.DECODER_FILE)
+    # EfficientViT-SAM
+    print("\n  EfficientViT-SAM (optional):")
+    enc_path = os.path.join(MODELS_DIR, EfficientViTSAMEngine.ENCODER_FILE)
+    dec_path = os.path.join(MODELS_DIR, EfficientViTSAMEngine.DECODER_FILE)
     info("Image encoder", os.path.isfile(enc_path),
          enc_path if os.path.isfile(enc_path) else "place in models/")
     info("Mask decoder", os.path.isfile(dec_path),
@@ -2583,8 +3212,9 @@ def print_banner():
     if LLM_MODEL:
         lines.append(f"  Model     : {LLM_MODEL}")
     lines.append(f"  TTS       : Piper ({'found' if os.path.isfile(PIPER_EXE) else 'NOT FOUND'})")
-    sam_enc = os.path.join(MODELS_DIR, NanoSAMEngine.ENCODER_FILE)
-    lines.append(f"  NanoSAM   : {'found' if os.path.isfile(sam_enc) else 'not installed (optional)'}")
+    sam_enc = os.path.join(MODELS_DIR, EfficientViTSAMEngine.ENCODER_FILE)
+    lines.append(f"  SAM       : {'found' if os.path.isfile(sam_enc) else 'not installed (optional)'}")
+    lines.append(f"  Faces     : {len(FaceRecognitionEngine().known_names)} known person(s)")
 
     print(f"\n{'='*58}")
     print("  WILSON V1 \u2014 Offline Voice Assistant")

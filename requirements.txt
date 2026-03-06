@@ -20,9 +20,9 @@ faster-whisper
 # ── Embedded LLM (no LM Studio / Ollama needed) ──────────────────────────────
 llama-cpp-python
 
-# ── Optional: NanoSAM real-time image segmentation ───────────────────────────
-# onnxruntime-gpu        # GPU inference for NanoSAM (or onnxruntime for CPU)
-# opencv-python          # Camera capture for NanoSAM
+# ── Optional: EfficientViT-SAM image segmentation + face recognition ─────────
+# onnxruntime-gpu        # GPU inference for EfficientViT-SAM (or onnxruntime for CPU)
+# opencv-python          # Camera capture, face detection & recognition
 
 # ── Optional: better audio resampling ────────────────────────────────────────
 # scipy

@@ -43,7 +43,8 @@ It's made up of three core technologies chained together:
 | 1. Listen | **faster-whisper** | Converts your voice into text (Speech-to-Text) |
 | 2. Think | **Embedded LLM** (llama-cpp-python) | Reads the text and generates a smart reply — no server needed |
 | 3. Speak | **Piper TTS** | Converts the reply text back into audio (Text-to-Speech) |
-| 4. See (optional) | **NanoSAM** | Real-time image segmentation via camera |
+| 4. See (optional) | **EfficientViT-SAM** | Real-time image segmentation via camera |
+| 5. Recognise | **Face Recognition** | Camera-based face detection, enrollment & management |
 
 Wilson supports **Windows, macOS, Linux, and NVIDIA Jetson** devices. It auto-detects your hardware and configures itself accordingly.
 
@@ -582,7 +583,7 @@ This class provides language model inference with **two modes**:
 Wilson now ships with a built-in LLM. On first launch it downloads a lightweight GGUF model (~1 GB) from HuggingFace and caches it in `models/`. After that, **no internet or external software is needed**.
 
 The default model (Qwen2.5-1.5B-Instruct Q4_K_M) is chosen to be:
-- Small enough to coexist with NanoSAM on a single GPU
+- Small enough to coexist with EfficientViT-SAM on a single GPU
 - Fast on both CPU and CUDA
 - Good at following instructions
 
@@ -631,20 +632,29 @@ Instead of crashing, Wilson returns a helpful error message that gets spoken alo
 
 ---
 
-### 5.9b NanoSAMEngine (Optional Vision — Image Segmentation)
+### 5.9b EfficientViTSAMEngine (Optional Vision — Image Segmentation)
 
-NanoSAM is NVIDIA's distilled Segment Anything Model that runs in real-time. Wilson integrates it as an **optional** capability:
+EfficientViT-SAM (MIT Han Lab) is a hardware-efficient Segment Anything Model that runs in real-time via ONNX Runtime. Wilson integrates it as an **optional** capability:
 
-- Place `nanosam_image_encoder.onnx` and `nanosam_mask_decoder.onnx` in the `models/` directory
+- Place `efficientvit_sam_encoder.onnx` and `efficientvit_sam_decoder.onnx` in the `models/` directory
 - Install `onnxruntime-gpu` and `opencv-python`
 - Wilson will auto-detect and load the models on startup
 
-NanoSAM can:
-- Open a camera and capture frames
-- Encode images into embeddings
-- Generate segmentation masks from point or box prompts
+Recommended model variants (fastest → best quality):
+- `efficientvit_sam_l0` (~30 MB) — fastest, lightweight
+- `efficientvit_sam_l1` (~45 MB) — balanced
+- `efficientvit_sam_xl0` (~120 MB) — high quality
+- `efficientvit_sam_xl1` (~180 MB) — maximum quality
 
-This is compatible with the embedded LLM because the default model (~1 GB) leaves plenty of GPU memory for NanoSAM (~10 MB).
+Get models from: https://github.com/mit-han-lab/efficientvit
+
+EfficientViT-SAM can:
+- Open a camera and capture frames
+- Encode images into embeddings (with ImageNet normalisation)
+- Generate segmentation masks from point or box prompts
+- Resize output masks back to original image dimensions
+
+This is compatible with the embedded LLM because the default model (~1 GB) leaves plenty of GPU memory for EfficientViT-SAM.
 
 ---
 
