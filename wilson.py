@@ -3,15 +3,21 @@ WILSON V1 — Offline Voice Assistant
 
 Supports : Windows, macOS (Intel & Apple Silicon), Linux, NVIDIA Jetson
 GPU      : NVIDIA CUDA auto-detected — falls back to CPU if unavailable
-Pipeline : Mic → faster-whisper (STT) → LLM (Ollama | LM Studio) → Piper TTS → Speaker
+Pipeline : Mic → faster-whisper (STT) → LLM (embedded llama.cpp) → Piper TTS → Speaker
+Standalone : Packable as a single .exe — no LM Studio / Ollama required.
+NanoSAM  : Optional real-time image segmentation when model files are present.
 
 Environment-variable overrides (all optional):
-  WILSON_LLM_URL           LLM API endpoint
-  WILSON_LLM_MODEL         Model name sent in API payload
+  WILSON_EMBEDDED_LLM       "1" (default) embedded LLM, "0" for remote API
+  WILSON_MODEL_REPO         HuggingFace repo for GGUF model
+  WILSON_MODEL_FILE         GGUF filename inside the repo
+  WILSON_GPU_LAYERS         Number of model layers on GPU (-1 = all)
+  WILSON_LLM_URL            Remote LLM API endpoint (fallback)
+  WILSON_LLM_MODEL          Model name sent in remote API payload
   WILSON_WHISPER_MODEL      Whisper size: tiny | base | small | medium
   WILSON_WHISPER_COMPUTE    Compute type: float16 | int8 | float32
   WILSON_WHISPER_DEVICE     Device: cuda | cpu
-  WILSON_MAX_TOKENS         Max response tokens (default 200)
+  WILSON_MAX_TOKENS         Max response tokens (default 1024)
   WILSON_LLM_TIMEOUT        Request timeout seconds
   WILSON_SYSTEM_PROMPT      System prompt override
   WILSON_HEADLESS           "1" for terminal-only mode (no GUI)
@@ -152,7 +158,20 @@ WILSON_DIR = os.path.dirname(os.path.abspath(__file__))
 PIPER_EXE   = os.path.join(WILSON_DIR, "piper", "piper.exe" if IS_WINDOWS else "piper")
 PIPER_VOICE = os.path.join(WILSON_DIR, "en_US-amy-medium.onnx")
 
-# ── LLM Backend ──────────────────────────────────────────────────────────────
+# ── Embedded LLM (default — no server needed) ────────────────────────────────
+#  Uses llama-cpp-python to load a GGUF model directly.
+#  Model auto-downloads from HuggingFace on first run (~1 GB).
+#  Chosen to be lightweight so it can coexist with NanoSAM on one GPU.
+USE_EMBEDDED_LLM = os.environ.get("WILSON_EMBEDDED_LLM", "1") == "1"
+MODELS_DIR       = os.path.join(WILSON_DIR, "models")
+
+EMBEDDED_MODEL_REPO = os.environ.get(
+    "WILSON_MODEL_REPO", "Qwen/Qwen2.5-1.5B-Instruct-GGUF")
+EMBEDDED_MODEL_FILE = os.environ.get(
+    "WILSON_MODEL_FILE", "qwen2.5-1.5b-instruct-q4_k_m.gguf")
+EMBEDDED_GPU_LAYERS = int(os.environ.get("WILSON_GPU_LAYERS", "-1"))   # -1 = all
+
+# ── Remote LLM Backend (fallback if embedded unavailable) ────────────────────
 #  Jetson       → Ollama (default http://localhost:11434)
 #  macOS / Linux → Ollama (most common local LLM on Mac/Linux)
 #  Windows      → LM Studio (default http://localhost:1234)
@@ -862,34 +881,189 @@ class TTSEngine:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#                           MODEL DOWNLOAD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def download_model(repo_id, filename, dest_dir, callback=None):
+    """Download a GGUF model file from HuggingFace Hub.
+    Supports resume if a partial download exists."""
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, filename)
+    if os.path.exists(dest_path):
+        return dest_path
+
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+
+    def log(msg):
+        if callback:
+            callback(msg)
+        print(f"[DOWNLOAD] {msg}")
+
+    log(f"Downloading {filename} from {repo_id}…")
+    log("One-time download — model will be cached in models/")
+
+    tmp_path = dest_path + ".downloading"
+    downloaded = 0
+    if os.path.exists(tmp_path):
+        downloaded = os.path.getsize(tmp_path)
+
+    headers = {}
+    if downloaded > 0:
+        headers["Range"] = f"bytes={downloaded}-"
+        log(f"Resuming from {downloaded / 1024 / 1024:.0f} MB")
+
+    try:
+        resp = requests.get(url, headers=headers, stream=True, timeout=30)
+        if resp.status_code == 416:          # Range not satisfiable → already done
+            os.rename(tmp_path, dest_path)
+            return dest_path
+        resp.raise_for_status()
+
+        total = int(resp.headers.get("content-length", 0)) + downloaded
+        mode = "ab" if downloaded > 0 else "wb"
+
+        with open(tmp_path, mode) as f:
+            for chunk in resp.iter_content(chunk_size=131072):  # 128 KB
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    pct = downloaded / total * 100
+                    mb  = downloaded / 1024 / 1024
+                    tmb = total / 1024 / 1024
+                    print(f"\r[DOWNLOAD] {mb:.0f}/{tmb:.0f} MB ({pct:.1f}%)",
+                          end="", flush=True)
+        print()
+
+        os.rename(tmp_path, dest_path)
+        log(f"Saved → {dest_path}")
+        return dest_path
+
+    except Exception as e:
+        log(f"Download failed: {e}")
+        raise
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #                              LLM CLIENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class LLMClient:
     """
-    Talks to any OpenAI-compatible chat completions API.
-      Jetson  → Ollama   (localhost:11434)
-      Windows → LM Studio (localhost:1234)
+    Language model client with two modes:
+
+      Embedded (default) — llama-cpp-python loads a GGUF model locally.
+                           No LM Studio / Ollama install required.
+      Remote  (fallback) — OpenAI-compatible HTTP API.
+
+    The embedded model is chosen to be small enough (~1 GB) to coexist
+    with NanoSAM on a single GPU.
     """
 
-    def __init__(self):
+    def __init__(self, embedded=None):
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if embedded is None:
+            embedded = USE_EMBEDDED_LLM
+        self._embedded = embedded
+        self._model    = None
+        self._loaded   = not embedded   # remote is instantly "ready"
+
+    # ── model loading (call from init thread) ────────────────────────────
+
+    def load(self, callback=None):
+        """Load the embedded LLM.  No-op for remote mode.
+        Returns True on success (including graceful fallback to remote)."""
+        if not self._embedded:
+            self._loaded = True
+            return True
+        return self._init_embedded(callback)
+
+    def _init_embedded(self, callback=None):
+        def log(msg):
+            if callback:
+                callback(msg)
+            print(f"[LLM] {msg}")
+
+        model_path = os.path.join(MODELS_DIR, EMBEDDED_MODEL_FILE)
+
+        # ── Download if missing ──
+        if not os.path.exists(model_path):
+            try:
+                download_model(EMBEDDED_MODEL_REPO, EMBEDDED_MODEL_FILE,
+                               MODELS_DIR, callback=callback)
+            except Exception as e:
+                log(f"Download failed: {e}")
+                log("Falling back to remote LLM (start LM Studio / Ollama)")
+                self._embedded = False
+                self._loaded   = True
+                return True
+
+        # ── Load with llama-cpp-python ──
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            log("llama-cpp-python not installed — pip install llama-cpp-python")
+            log("Falling back to remote LLM")
+            self._embedded = False
+            self._loaded   = True
+            return True
+
+        try:
+            n_gpu = EMBEDDED_GPU_LAYERS if CUDA_AVAILABLE else 0
+            log(f"Loading {EMBEDDED_MODEL_FILE} …")
+            self._model = Llama(
+                model_path=model_path,
+                n_ctx=4096,
+                n_gpu_layers=n_gpu,
+                verbose=False,
+            )
+            gpu_str = f"GPU, {n_gpu} layers" if n_gpu else "CPU only"
+            log(f"Model ready ({gpu_str})")
+            self._loaded = True
+            return True
+        except Exception as e:
+            log(f"Failed to load model: {e}")
+            log("Falling back to remote LLM")
+            self._embedded = False
+            self._loaded   = True
+            return True
+
+    # ── thinking-tag cleanup ─────────────────────────────────────────────
 
     @staticmethod
     def _strip_thinking(text):
-        """Remove <think>...</think> blocks emitted by reasoning models
-        (DeepSeek R1, QwQ, etc.) so only the final answer is spoken aloud."""
+        """Remove <think>…</think> blocks emitted by reasoning models
+        (DeepSeek R1, QwQ, etc.) so only the final answer is spoken."""
         cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text)
-        # Also handle unclosed <think> blocks (model still reasoning at max_tokens)
         cleaned = re.sub(r"<think>[\s\S]*$", "", cleaned)
         return cleaned.strip()
 
+    # ── query dispatch ───────────────────────────────────────────────────
+
     def query(self, user_input):
         self.messages.append({"role": "user", "content": user_input})
+        if self._embedded and self._model is not None:
+            return self._query_embedded()
+        return self._query_remote()
 
+    def _query_embedded(self):
+        """Run inference locally via llama-cpp-python."""
+        try:
+            resp = self._model.create_chat_completion(
+                messages=self.messages[-21:],
+                max_tokens=MAX_TOKENS,
+                temperature=0.7,
+            )
+            raw_reply = resp["choices"][0]["message"]["content"]
+            self.messages.append({"role": "assistant", "content": raw_reply})
+            return self._strip_thinking(raw_reply)
+        except Exception as e:
+            return f"LLM error: {e}"
+
+    def _query_remote(self):
+        """Call an OpenAI-compatible API (LM Studio / Ollama)."""
         payload = {
-            "messages": self.messages[-21:],       # rolling context window
-            "stream": False,
+            "messages": self.messages[-21:],
+            "stream":     False,
             "max_tokens": MAX_TOKENS,
             "temperature": 0.7,
         }
@@ -900,14 +1074,13 @@ class LLMClient:
             resp = requests.post(LLM_URL, json=payload, timeout=LLM_TIMEOUT)
             resp.raise_for_status()
             raw_reply = resp.json()["choices"][0]["message"]["content"]
-            # Store full reply in history (thinking context helps future turns)
             self.messages.append({"role": "assistant", "content": raw_reply})
-            # Return only the visible answer (strip reasoning blocks)
             return self._strip_thinking(raw_reply)
         except requests.exceptions.ConnectionError:
-            backend = "LM Studio" if IS_WINDOWS else "Ollama"
-            port    = "1234"      if IS_WINDOWS else "11434"
-            return f"Cannot connect to {backend}. Start the server on port {port}."
+            return (
+                "Cannot connect to LLM server.  Install llama-cpp-python for "
+                "embedded mode, or start LM Studio / Ollama."
+            )
         except requests.exceptions.Timeout:
             return (
                 "LLM timed out. Model may be too large for available memory. "
@@ -918,6 +1091,172 @@ class LLMClient:
 
     def clear_history(self):
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    @property
+    def mode(self):
+        """Return 'embedded' or 'remote' depending on active backend."""
+        return "embedded" if self._embedded else "remote"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                          NANOSAM INTEGRATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class NanoSAMEngine:
+    """
+    Optional NanoSAM (Segment Anything — NVIDIA distilled) integration.
+
+    Provides real-time image segmentation when the ONNX model files are
+    present in the models/ directory.  Wilson can use this to "see" and
+    describe objects through a connected camera.
+
+    Required files in models/:
+      nanosam_image_encoder.onnx   — image encoder (~6 MB)
+      nanosam_mask_decoder.onnx    — mask decoder  (~4 MB)
+
+    Install:
+      pip install onnxruntime-gpu opencv-python
+
+    NanoSAM is entirely optional.  Wilson works fine without it.
+    """
+
+    ENCODER_FILE = "nanosam_image_encoder.onnx"
+    DECODER_FILE = "nanosam_mask_decoder.onnx"
+
+    def __init__(self):
+        self.available     = False
+        self._encoder      = None
+        self._decoder      = None
+        self._camera       = None
+        self._camera_lock  = threading.Lock()
+        self._try_load()
+
+    def _try_load(self):
+        """Attempt to load NanoSAM models.  Silent no-op if unavailable."""
+        enc_path = os.path.join(MODELS_DIR, self.ENCODER_FILE)
+        dec_path = os.path.join(MODELS_DIR, self.DECODER_FILE)
+
+        if not os.path.isfile(enc_path) or not os.path.isfile(dec_path):
+            return
+
+        try:
+            import onnxruntime as ort
+            providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                         if CUDA_AVAILABLE
+                         else ["CPUExecutionProvider"])
+            self._encoder = ort.InferenceSession(enc_path, providers=providers)
+            self._decoder = ort.InferenceSession(dec_path, providers=providers)
+            self.available = True
+            print("[NANOSAM] Image encoder + mask decoder loaded")
+        except ImportError:
+            print("[NANOSAM] onnxruntime not installed — pip install onnxruntime-gpu")
+        except Exception as e:
+            print(f"[NANOSAM] Load failed: {e}")
+
+    # ── camera ────────────────────────────────────────────────────────────
+
+    def open_camera(self, device_id=0):
+        """Open a camera for capture.  Returns True on success."""
+        try:
+            import cv2
+            with self._camera_lock:
+                if self._camera is not None:
+                    self._camera.release()
+                self._camera = cv2.VideoCapture(device_id)
+                ok = self._camera.isOpened()
+                if ok:
+                    print(f"[NANOSAM] Camera {device_id} opened")
+                return ok
+        except ImportError:
+            print("[NANOSAM] opencv-python not installed")
+            return False
+        except Exception as e:
+            print(f"[NANOSAM] Camera error: {e}")
+            return False
+
+    def capture_frame(self):
+        """Capture a single frame.  Returns numpy HWC BGR array or None."""
+        with self._camera_lock:
+            if self._camera is None or not self._camera.isOpened():
+                return None
+            ret, frame = self._camera.read()
+            return frame if ret else None
+
+    def close_camera(self):
+        with self._camera_lock:
+            if self._camera is not None:
+                self._camera.release()
+                self._camera = None
+
+    # ── inference ─────────────────────────────────────────────────────────
+
+    def encode_image(self, image_bgr):
+        """Run the image encoder.  Returns the image embedding tensor."""
+        if not self.available or self._encoder is None:
+            return None
+        try:
+            import cv2
+            # NanoSAM expects 3×1024×1024 float32 normalised
+            img = cv2.resize(image_bgr, (1024, 1024))
+            img = img.astype(np.float32) / 255.0
+            img = np.transpose(img, (2, 0, 1))[np.newaxis]      # NCHW
+            inp_name = self._encoder.get_inputs()[0].name
+            return self._encoder.run(None, {inp_name: img})[0]
+        except Exception as e:
+            print(f"[NANOSAM] Encode error: {e}")
+            return None
+
+    def segment(self, image_embedding, point=None, box=None):
+        """Run the mask decoder.  Returns binary mask (H×W bool array) or None.
+
+        Args:
+            image_embedding: output of encode_image()
+            point: (x, y) normalised [0-1] click coordinate
+            box:   (x1, y1, x2, y2) normalised bounding box
+        """
+        if not self.available or self._decoder is None or image_embedding is None:
+            return None
+        try:
+            # Build prompt tensors (simplified — real NanoSAM has more inputs)
+            if point is not None:
+                coords = np.array([[point]], dtype=np.float32)  # 1×1×2
+                labels = np.array([[1]], dtype=np.float32)      # foreground
+            elif box is not None:
+                coords = np.array([[[box[0], box[1]], [box[2], box[3]]]], dtype=np.float32)
+                labels = np.array([[2, 3]], dtype=np.float32)
+            else:
+                # Centre-point default
+                coords = np.array([[[0.5, 0.5]]], dtype=np.float32)
+                labels = np.array([[1]], dtype=np.float32)
+
+            inputs = {}
+            for inp in self._decoder.get_inputs():
+                name = inp.name.lower()
+                if "image" in name or "embed" in name:
+                    inputs[inp.name] = image_embedding
+                elif "coord" in name or "point" in name:
+                    inputs[inp.name] = coords
+                elif "label" in name:
+                    inputs[inp.name] = labels
+
+            masks = self._decoder.run(None, inputs)
+            if masks and len(masks) > 0:
+                mask = masks[0][0, 0] > 0.0    # first mask, threshold
+                return mask
+            return None
+        except Exception as e:
+            print(f"[NANOSAM] Segment error: {e}")
+            return None
+
+    @property
+    def status(self):
+        if self.available:
+            return "ready"
+        enc = os.path.isfile(os.path.join(MODELS_DIR, self.ENCODER_FILE))
+        dec = os.path.isfile(os.path.join(MODELS_DIR, self.DECODER_FILE))
+        if not enc or not dec:
+            return "model files missing"
+        return "load failed"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -992,6 +1331,7 @@ class WilsonGUI:
         self.transcriber   = None
         self.tts           = None
         self.llm           = LLMClient()
+        self.nanosam       = NanoSAMEngine()
         self.monitor       = JetsonMonitor()
         self.msg_queue     = queue.Queue()
 
@@ -1206,9 +1546,40 @@ class WilsonGUI:
         self.chat.tag_configure("system", foreground="#004d1a", font=(FONT_MONO, 9), justify=tk.CENTER)
         self.chat.tag_configure("cursor_blink", foreground="#00ff41", font=(FONT_MONO, 10, "bold"))
 
+        # ── Text chat input ───────────────────────────────────────────────
+        chat_input_frame = tk.Frame(self.main_container, bg=t["bg_main"])
+        chat_input_frame.pack(fill=tk.X, padx=10, pady=(2, 0))
+
+        self.chat_input = tk.Entry(
+            chat_input_frame,
+            font=(FONT_MONO, 10),
+            bg="#0a1a0a", fg="#00ff41",
+            insertbackground="#00ff41",
+            highlightthickness=1, highlightbackground="#003300",
+            highlightcolor="#00ff41",
+            relief=tk.FLAT, bd=1,
+        )
+        self.chat_input.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        self.chat_input.bind("<Return>", lambda e: self._send_text())
+        # Prevent spacebar from triggering voice while typing
+        self.chat_input.bind("<space>", lambda e: "break" if False else None)
+
+        send_btn = tk.Button(
+            chat_input_frame,
+            text=">",
+            font=(FONT_MONO, 12, "bold"),
+            bg="#0a1a0a", fg="#00ff41",
+            activebackground="#003300", activeforeground="#33ff66",
+            highlightthickness=1, highlightbackground="#003300",
+            relief=tk.SOLID, bd=1, width=3,
+            cursor="hand2",
+            command=self._send_text,
+        )
+        send_btn.pack(side=tk.RIGHT, padx=(4, 0))
+
         # Button row — side by side
         btn_row = tk.Frame(self.main_container, bg=t["bg_main"])
-        btn_row.pack(pady=(8, 6))
+        btn_row.pack(pady=(6, 6))
 
         # Listen button — Matrix style
         self.btn = tk.Button(
@@ -1223,7 +1594,8 @@ class WilsonGUI:
             command=self._toggle_listening,
         )
         self.btn.pack(side=tk.LEFT, padx=(0, 4))
-        self.root.bind("<space>", lambda e: self._toggle_listening())
+        # Only trigger voice on Space if the text input doesn't have focus
+        self.root.bind("<space>", lambda e: self._toggle_listening() if e.widget is not self.chat_input else None)
 
         # Auto-listen toggle button
         self.auto_btn = tk.Button(
@@ -1240,10 +1612,11 @@ class WilsonGUI:
         self.auto_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         # Footer — Matrix terminal info
-        _llm_name = "LM Studio" if IS_WINDOWS else "Ollama"
+        _llm_name = "Embedded" if USE_EMBEDDED_LLM else ("LM Studio" if IS_WINDOWS else "Ollama")
+        _sam_tag  = " | SAM:ready" if os.path.isfile(os.path.join(MODELS_DIR, NanoSAMEngine.ENCODER_FILE)) else ""
         cfg = (
             f"STT:{WHISPER_MODEL}({WHISPER_DEVICE}) | "
-            f"LLM:{_llm_name}"
+            f"LLM:{_llm_name}{_sam_tag}"
         )
         tk.Label(
             self.main_container, text=cfg,
@@ -1252,7 +1625,7 @@ class WilsonGUI:
 
         tk.Label(
             self.main_container,
-            text=i18n["footer_hints"] + "  |  [ESC] quit",
+            text=i18n["footer_hints"] + "  |  type to chat  |  [ESC] quit",
             font=(FONT_MONO, 7), fg="#004d1a", bg=t["bg_main"],
         ).pack(pady=(1, 4))
 
@@ -1649,6 +2022,13 @@ class WilsonGUI:
             tts_name = "Piper" if self.tts.has_piper else ("espeak-ng" if self.tts.has_espeak else "NONE")
             self._log("system", f"TTS: {tts_name}")
 
+            self._log("system", "Loading LLM…")
+            self.llm.load(callback=lambda m: self._log("system", m))
+            self._log("system", f"LLM mode: {self.llm.mode}")
+
+            if self.nanosam.available:
+                self._log("system", "NanoSAM: ready")
+
             self.transcriber = Transcriber()
             loaded = self.transcriber.load(callback=lambda m: self._log("system", m))
             print(f"[DEBUG] Whisper load returned: {loaded}, model is None: {self.transcriber.model is None}")
@@ -1808,6 +2188,52 @@ class WilsonGUI:
             except Exception:
                 break
 
+    # ── text chat ─────────────────────────────────────────────────────────────
+
+    def _send_text(self):
+        """Send typed text through the LLM pipeline (skips STT)."""
+        text = self.chat_input.get().strip()
+        if not text or self.is_processing:
+            return
+        if not self._ready:
+            self._log("system", "Still loading, please wait\u2026")
+            return
+        self.chat_input.delete(0, tk.END)
+        self.is_processing = True
+        self.btn.config(text=self.I18N["btn_process"], state=tk.DISABLED)
+        self._fade_button_color(self.THEME["accent_process"])
+        self._set_status(self.I18N["status_process"], self.THEME["accent_process"])
+        threading.Thread(target=self._process_text, args=(text,), daemon=True).start()
+
+    def _process_text(self, text):
+        """Process typed text: LLM → TTS (no STT needed)."""
+        try:
+            self._log("user", text)
+
+            # LLM
+            self.root.after(0, lambda: self._set_status(self.I18N["status_think"], self.THEME["accent_process"]))
+            response = self.llm.query(text)
+
+            # TTS with mouth animation
+            self.root.after(0, lambda: self._set_status(self.I18N["status_speak"], self.THEME["accent_ready"]))
+            audio_data, sr = self.tts.generate_wav(response, log_fn=lambda m: self._log("system", m))
+            if audio_data is not None and sr is not None:
+                amps = self._compute_mouth_amplitudes(audio_data, sr)
+                duration = len(audio_data) / sr
+                self._log("wilson", response)
+                self.root.after(0, lambda a=amps, d=duration: self._start_mouth_anim(a, d))
+                _get_sd().play(audio_data, sr)
+                _get_sd().wait()
+                self.root.after(0, self._stop_mouth_anim)
+            else:
+                self._log("wilson", response)
+                self.tts.speak(response, log_fn=lambda m: self._log("system", m))
+
+        except Exception as e:
+            self._log("system", f"Pipeline error: {e}")
+        finally:
+            self.root.after(0, self._reset)
+
     # ── processing pipeline ───────────────────────────────────────────────────
 
     def _process(self, audio):
@@ -1937,6 +2363,10 @@ class WilsonHeadless:
 
         self._print("system", "Loading TTS\u2026")
         self.tts = TTSEngine()
+
+        self._print("system", "Loading LLM\u2026")
+        self.llm.load(callback=lambda m: self._print("system", m))
+        self._print("system", f"LLM mode: {self.llm.mode}")
 
         self.transcriber = Transcriber()
         self.transcriber.load(callback=lambda m: self._print("system", m))
@@ -2081,15 +2511,40 @@ def run_diagnostics():
               mac_say if mac_say else "optional — not needed if Piper is installed")
 
     # LLM
-    print("\n  LLM endpoint:")
+    print("\n  LLM:")
+    if USE_EMBEDDED_LLM:
+        model_path = os.path.join(MODELS_DIR, EMBEDDED_MODEL_FILE)
+        check("Embedded model file", os.path.isfile(model_path),
+              EMBEDDED_MODEL_FILE if os.path.isfile(model_path) else "will be downloaded on first run")
+        try:
+            from llama_cpp import Llama
+            check("llama-cpp-python", True)
+        except ImportError:
+            check("llama-cpp-python", False, "pip install llama-cpp-python")
+    else:
+        print("  (Remote mode — checking API endpoint)")
+        try:
+            r = requests.get(
+                LLM_URL.replace("/chat/completions", "/models"),
+                timeout=(2, 5),
+            )
+            check("API reachable", r.status_code == 200, LLM_URL)
+        except Exception:
+            check("API reachable", False, f"{LLM_URL} — is the server running?")
+
+    # NanoSAM
+    print("\n  NanoSAM (optional):")
+    enc_path = os.path.join(MODELS_DIR, NanoSAMEngine.ENCODER_FILE)
+    dec_path = os.path.join(MODELS_DIR, NanoSAMEngine.DECODER_FILE)
+    info("Image encoder", os.path.isfile(enc_path),
+         enc_path if os.path.isfile(enc_path) else "place in models/")
+    info("Mask decoder", os.path.isfile(dec_path),
+         dec_path if os.path.isfile(dec_path) else "place in models/")
     try:
-        r = requests.get(
-            LLM_URL.replace("/chat/completions", "/models"),
-            timeout=(2, 5),          # (connect, read) — fail fast if nothing is listening
-        )
-        check("API reachable", r.status_code == 200, LLM_URL)
-    except Exception:
-        check("API reachable", False, f"{LLM_URL} — is the server running?")
+        import onnxruntime
+        info("onnxruntime", True, onnxruntime.__version__)
+    except ImportError:
+        info("onnxruntime", False, "pip install onnxruntime-gpu (optional)")
 
     # Microphone
     print("\n  Audio:")
@@ -2120,11 +2575,16 @@ def print_banner():
     lines = [
         f"  Hardware  : {hw}",
         f"  Whisper   : {WHISPER_MODEL} ({WHISPER_DEVICE}/{WHISPER_COMPUTE})",
-        f"  LLM       : {LLM_URL}",
     ]
+    if USE_EMBEDDED_LLM:
+        lines.append(f"  LLM       : Embedded ({EMBEDDED_MODEL_FILE})")
+    else:
+        lines.append(f"  LLM       : {LLM_URL}")
     if LLM_MODEL:
         lines.append(f"  Model     : {LLM_MODEL}")
     lines.append(f"  TTS       : Piper ({'found' if os.path.isfile(PIPER_EXE) else 'NOT FOUND'})")
+    sam_enc = os.path.join(MODELS_DIR, NanoSAMEngine.ENCODER_FILE)
+    lines.append(f"  NanoSAM   : {'found' if os.path.isfile(sam_enc) else 'not installed (optional)'}")
 
     print(f"\n{'='*58}")
     print("  WILSON V1 \u2014 Offline Voice Assistant")

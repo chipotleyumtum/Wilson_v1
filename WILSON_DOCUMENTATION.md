@@ -41,8 +41,9 @@ It's made up of three core technologies chained together:
 | Step | Technology | What it does |
 |------|-----------|-------------|
 | 1. Listen | **faster-whisper** | Converts your voice into text (Speech-to-Text) |
-| 2. Think | **LLM** (LM Studio or Ollama) | Reads the text and generates a smart reply |
+| 2. Think | **Embedded LLM** (llama-cpp-python) | Reads the text and generates a smart reply — no server needed |
 | 3. Speak | **Piper TTS** | Converts the reply text back into audio (Text-to-Speech) |
+| 4. See (optional) | **NanoSAM** | Real-time image segmentation via camera |
 
 Wilson supports **Windows, macOS, Linux, and NVIDIA Jetson** devices. It auto-detects your hardware and configures itself accordingly.
 
@@ -569,15 +570,32 @@ LLMs sometimes include markdown formatting (`*bold*`, `# heading`, `` `code` ``)
 
 ### 5.9 LLMClient (The AI Brain)
 
+This class provides language model inference with **two modes**:
+
+| Mode | Backend | When used |
+|------|---------|-----------|
+| **Embedded** (default) | `llama-cpp-python` loads a GGUF model | No server, no internet after first download |
+| **Remote** (fallback) | HTTP API (LM Studio / Ollama) | If embedded fails or `WILSON_EMBEDDED_LLM=0` |
+
+#### Embedded mode (default — no extra software)
+
+Wilson now ships with a built-in LLM. On first launch it downloads a lightweight GGUF model (~1 GB) from HuggingFace and caches it in `models/`. After that, **no internet or external software is needed**.
+
+The default model (Qwen2.5-1.5B-Instruct Q4_K_M) is chosen to be:
+- Small enough to coexist with NanoSAM on a single GPU
+- Fast on both CPU and CUDA
+- Good at following instructions
+
+You can change the model via environment variables:
 ```
-Lines 657–725
+WILSON_MODEL_REPO=Qwen/Qwen2.5-1.5B-Instruct-GGUF
+WILSON_MODEL_FILE=qwen2.5-1.5b-instruct-q4_k_m.gguf
+WILSON_GPU_LAYERS=-1
 ```
 
-This class sends your transcribed speech to a local AI model and gets a reply.
+#### Remote mode (fallback)
 
-#### The OpenAI-compatible API
-
-Both LM Studio and Ollama implement the same API format as OpenAI's ChatGPT. This means Wilson's code works with either one (or any compatible server) without changes:
+If embedded loading fails (or `WILSON_EMBEDDED_LLM=0`), Wilson falls back to calling an OpenAI-compatible HTTP API. Both LM Studio and Ollama implement this format:
 
 ```python
 payload = {
@@ -603,28 +621,30 @@ The `[-21:]` slice keeps only the last 21 messages (system prompt + 10 exchanges
 
 #### Thinking model support
 
-Some AI models (like DeepSeek R1, Qwen QwQ) include their reasoning process in `<think>...</think>` tags. This is useful for complex questions but sounds terrible when spoken aloud:
-
-```python
-@staticmethod
-def _strip_thinking(text):
-    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text)  # Complete blocks
-    cleaned = re.sub(r"<think>[\s\S]*$", "", cleaned)        # Unclosed blocks
-    return cleaned.strip()
-```
-
-Wilson stores the full response (including thinking) in the conversation history (so the AI has context for follow-up questions), but only speaks the final answer.
+Some AI models (like DeepSeek R1, Qwen QwQ) include their reasoning process in `<think>...</think>` tags. Wilson stores the full response (including thinking) in the conversation history for context, but only speaks the final answer.
 
 #### Error handling
 
-```python
-except requests.exceptions.ConnectionError:
-    return "Cannot connect to LM Studio. Start the server on port 1234."
-except requests.exceptions.Timeout:
-    return "LLM timed out. Try a smaller model."
-```
+Instead of crashing, Wilson returns a helpful error message that gets spoken aloud:
+- Embedded mode: returns the exception details
+- Remote mode: tells you to start LM Studio / Ollama or install llama-cpp-python
 
-Instead of crashing, Wilson returns a helpful error message that gets spoken aloud, so you know what went wrong even without looking at the screen.
+---
+
+### 5.9b NanoSAMEngine (Optional Vision — Image Segmentation)
+
+NanoSAM is NVIDIA's distilled Segment Anything Model that runs in real-time. Wilson integrates it as an **optional** capability:
+
+- Place `nanosam_image_encoder.onnx` and `nanosam_mask_decoder.onnx` in the `models/` directory
+- Install `onnxruntime-gpu` and `opencv-python`
+- Wilson will auto-detect and load the models on startup
+
+NanoSAM can:
+- Open a camera and capture frames
+- Encode images into embeddings
+- Generate segmentation masks from point or box prompts
+
+This is compatible with the embedded LLM because the default model (~1 GB) leaves plenty of GPU memory for NanoSAM (~10 MB).
 
 ---
 

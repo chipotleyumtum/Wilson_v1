@@ -1,0 +1,31 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# WILSON V1 — Dependencies
+# ═══════════════════════════════════════════════════════════════════════════════
+# Install:  pip install -r requirements.txt
+#
+# For GPU (NVIDIA CUDA) support, also install:
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+#   (replace cu124 with your CUDA version: cu121, cu122, cu123, cu124)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+numpy
+requests
+sounddevice
+soundfile
+
+# ── Speech-to-Text (Whisper) ──────────────────────────────────────────────────
+faster-whisper
+
+# ── Embedded LLM (no LM Studio / Ollama needed) ──────────────────────────────
+llama-cpp-python
+
+# ── Optional: NanoSAM real-time image segmentation ───────────────────────────
+# onnxruntime-gpu        # GPU inference for NanoSAM (or onnxruntime for CPU)
+# opencv-python          # Camera capture for NanoSAM
+
+# ── Optional: better audio resampling ────────────────────────────────────────
+# scipy
+
+# ── Build (only needed to create the .exe) ───────────────────────────────────
+# pyinstaller
