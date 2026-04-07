@@ -498,8 +498,11 @@ class AudioRecorder:
     # ── callbacks ─────────────────────────────────────────────────────────────
 
     def _callback(self, indata, frames, time_info, status):
-        if self.is_recording:
-            self.audio_data.append(indata.copy())
+        # We must collect the audio as long as we are recording
+        if self.is_recording and indata is not None and indata.size > 0:
+            # prevent bad data propagation
+            data = np.nan_to_num(indata, nan=0.0, posinf=1.0, neginf=-1.0)
+            self.audio_data.append(data.copy())
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -728,6 +731,8 @@ class TTSEngine:
         )
         # macOS ships with the 'say' command — use it as a last-resort fallback
         self.has_say = IS_MACOS and shutil.which("say") is not None
+        
+        self.active_process = None
 
         if self.has_piper:
             # Ensure +x on Linux / macOS
@@ -764,18 +769,20 @@ class TTSEngine:
         text = re.sub(r"[*#`]", "", text).replace("\n", " ").strip()
         if not text or not self.has_piper:
             return None, None
-        tmp = os.path.join(tempfile.gettempdir(), "wilson_tts_gen.wav")
+            
+        import uuid
+        tmp = os.path.join(tempfile.gettempdir(), f"wilson_tts_gen_{uuid.uuid4().hex[:8]}.wav")
         try:
-            proc = subprocess.Popen(
+            self.active_process = subprocess.Popen(
                 [PIPER_EXE, "--model", PIPER_VOICE, "--output_file", tmp],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            proc.communicate(input=text.encode("utf-8"), timeout=30)
-            proc.wait()
+            self.active_process.communicate(input=text.encode("utf-8"), timeout=30)
+            rc = self.active_process.wait()
             time.sleep(0.05)
-            if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            if rc == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
                 import soundfile as sf
                 data, sr = sf.read(tmp)
                 return data, sr
@@ -783,28 +790,38 @@ class TTSEngine:
             if log_fn:
                 log_fn(f"TTS generate error: {e}")
         finally:
+            self.active_process = None
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
         return None, None
 
+    def interrupt(self):
+        """Kills any ongoing TTS generation."""
+        if self.active_process:
+            try:
+                self.active_process.kill()
+            except Exception:
+                pass
+
     # ── Piper ─────────────────────────────────────────────────────────────────
 
     def _piper(self, text, log_fn=None):
-        tmp = os.path.join(tempfile.gettempdir(), "wilson_tts.wav")
+        import uuid
+        tmp = os.path.join(tempfile.gettempdir(), f"wilson_tts_{uuid.uuid4().hex[:8]}.wav")
         try:
-            proc = subprocess.Popen(
+            self.active_process = subprocess.Popen(
                 [PIPER_EXE, "--model", PIPER_VOICE, "--output_file", tmp],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            proc.communicate(input=text.encode("utf-8"), timeout=30)
-            proc.wait()
+            self.active_process.communicate(input=text.encode("utf-8"), timeout=30)
+            rc = self.active_process.wait()
             time.sleep(0.05)
 
-            if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            if rc == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
                 import soundfile as sf
                 data, sr = sf.read(tmp)
                 _get_sd().play(data, sr)
@@ -813,7 +830,7 @@ class TTSEngine:
             if log_fn:
                 log_fn("TTS timed out")
             try:
-                proc.kill()
+                self.active_process.kill()
             except Exception:
                 pass
         except FileNotFoundError:
@@ -828,6 +845,7 @@ class TTSEngine:
             if log_fn:
                 log_fn(f"TTS error: {e}")
         finally:
+            self.active_process = None
             try:
                 os.unlink(tmp)
             except OSError:
@@ -838,27 +856,33 @@ class TTSEngine:
     def _espeak(self, text, log_fn=None):
         cmd = "espeak-ng" if shutil.which("espeak-ng") else "espeak"
         try:
-            subprocess.run(
+            self.active_process = subprocess.Popen(
                 [cmd, "-v", "en", "-s", "160", "--", text],
-                capture_output=True,
-                timeout=30,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
             )
+            self.active_process.communicate(timeout=30)
         except Exception as e:
             if log_fn:
                 log_fn(f"espeak error: {e}")
+        finally:
+            self.active_process = None
 
     # ── macOS 'say' fallback ──────────────────────────────────────────────────
 
     def _say(self, text, log_fn=None):
         try:
-            subprocess.run(
+            self.active_process = subprocess.Popen(
                 ["say", "-v", "Samantha", text],
-                capture_output=True,
-                timeout=30,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
             )
+            self.active_process.communicate(timeout=30)
         except Exception as e:
             if log_fn:
                 log_fn(f"macOS say error: {e}")
+        finally:
+            self.active_process = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -988,6 +1012,7 @@ class WilsonGUI:
         self.is_processing = False
         self._ready        = False   # True once init thread completes successfully
         self._auto_listen  = False   # hands-free voice-activated mode
+        self._is_interrupted = False
         self.recorder      = None
         self.transcriber   = None
         self.tts           = None
@@ -1751,6 +1776,7 @@ class WilsonGUI:
             return
         # The recorder is already running from the detection phase —
         # just set the UI to listening state and arm the silence watchdog
+        self._is_interrupted = False
         self.is_listening = True
         self.btn.config(text=self.I18N["btn_listen"])
         self._fade_button_color(self.THEME["accent_listen"])
@@ -1759,6 +1785,7 @@ class WilsonGUI:
 
     def _toggle_listening(self):
         if self.is_processing:
+            self._interrupt()
             return
         if not self._ready:
             self._log("system", "Still loading, please wait\u2026")
@@ -1766,7 +1793,28 @@ class WilsonGUI:
         if self.is_listening:
             self._stop_listening()
         else:
+            self._is_interrupted = False
             self._start_listening()
+
+    def _interrupt(self):
+        """Interrupts processing and speech."""
+        self._is_interrupted = True
+        self._log("system", "Interrupted by user.")
+        
+        # Clear the message queue so remaining TTS text doesn't keep printing
+        while not self.msg_queue.empty():
+            try:
+                self.msg_queue.get_nowait()
+            except queue.Empty:
+                break
+                
+        try:
+            _get_sd().stop()
+            if hasattr(self, "tts") and hasattr(self.tts, "interrupt"):
+                self.tts.interrupt()
+        except Exception:
+            pass
+        self.root.after(0, self._stop_mouth_anim)
 
     def _start_listening(self):
         self.is_listening = True
@@ -1781,8 +1829,8 @@ class WilsonGUI:
             return
         self.is_listening = False
         self.is_processing = True
-        self.btn.config(text=self.I18N["btn_process"], state=tk.DISABLED)
-        self._fade_button_color(self.THEME["accent_process"])
+        self.btn.config(text="INTERRUPT", state=tk.NORMAL)
+        self._fade_button_color(self.THEME.get("accent_error", "#cc0000"))
         self._set_status(self.I18N["status_process"], self.THEME["accent_process"])
         audio = self.recorder.stop()
         if audio is not None and len(audio) > SAMPLE_RATE * 0.5:
@@ -1816,6 +1864,9 @@ class WilsonGUI:
             self.root.after(0, lambda: self._set_status(self.I18N["status_transcribe"], self.THEME["accent_process"]))
             text = self.transcriber.transcribe(audio)
 
+            if self._is_interrupted:
+                return
+
             if not text or len(text.strip()) < 2:
                 self._log("system", "Couldn't understand. Speak louder / closer to the mic.")
                 self.root.after(0, self._reset)
@@ -1823,13 +1874,23 @@ class WilsonGUI:
 
             self._log("user", text.strip())
 
+            if self._is_interrupted:
+                return
+
             # LLM
             self.root.after(0, lambda: self._set_status(self.I18N["status_think"], self.THEME["accent_process"]))
             response = self.llm.query(text)
 
+            if self._is_interrupted:
+                return
+
             # TTS with mouth animation — text appears in sync with speech
             self.root.after(0, lambda: self._set_status(self.I18N["status_speak"], self.THEME["accent_ready"]))
             audio_data, sr = self.tts.generate_wav(response, log_fn=lambda m: self._log("system", m))
+            
+            if self._is_interrupted:
+                return
+                
             if audio_data is not None and sr is not None:
                 amps = self._compute_mouth_amplitudes(audio_data, sr)
                 duration = len(audio_data) / sr
@@ -1846,6 +1907,8 @@ class WilsonGUI:
         except Exception as e:
             self._log("system", f"Pipeline error: {e}")
         finally:
+            if self._is_interrupted:
+                self._log("system", "Aborted.")
             self.root.after(0, self._reset)
 
     def _reset(self):
